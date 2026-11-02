@@ -1,4 +1,4 @@
-name: Verify Kotlin standalone APK
+﻿name: Verify Kotlin standalone APK
 on:
   workflow_dispatch:
 permissions:
