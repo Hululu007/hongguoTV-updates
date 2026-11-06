@@ -6,6 +6,17 @@
 
 > 使用中遇到问题、有功能建议，请到 **[hongguoTV-updates issues](https://github.com/jycao2/hongguoTV-updates/issues)** 提交。该仓库同时承载版本更新与下载，问题与建议统一在那里提出，方便跟进修复与回复。
 
+<!-- updates-repo-only:start -->
+## 关于 hongguoTV-updates
+
+本仓库是电视端客户端的**发布镜像与更新通道**，不是源码开发仓库：
+
+- **版本发布与下载**：所有版本都在本仓库 [Releases](https://github.com/jycao2/hongguoTV-updates/releases) 发布，每个版本附 APK、`update.json` 与 `SHA256SUMS`
+- **旧版更新来源**：0.11.0 及更早的客户端从这里读取 `releases/latest/download/update.json` 检查更新，因此每次新版发布都会同步到本仓库
+- **问题反馈**：安装、播放、更新等方面的问题与建议统一在本仓库 [Issues](https://github.com/jycao2/hongguoTV-updates/issues) 受理
+- **源码位置**：客户端源码与开发都在 [hongguoTV](https://github.com/jycao2/hongguoTV) 主仓库；本仓库的 `kotlin-tv/`、`docs/`、`scripts/` 等为同步镜像，请勿在此直接修改代码
+<!-- updates-repo-only:end -->
+
 ## 主要功能
 
 - **浏览**：首页接着看 / 收藏有更新 / 稍后看 / 热门发现横向剧架，随机荐剧一键换一批，漫剧 / 短剧热播榜，24+8 个题材分类浏览，多季剧详情页直接跳季
