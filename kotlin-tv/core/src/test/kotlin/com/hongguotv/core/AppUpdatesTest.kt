@@ -12,8 +12,8 @@ import java.security.MessageDigest
 class AppUpdatesTest {
     private val bytes = "signed-apk-test-bytes".toByteArray()
     private fun json() = JSONObject().put("schema", 1).put("packageName", "com.hongguotv.nativeapp")
-        .put("versionCode", 10001).put("versionName", "0.9.0+1").put("minSdk", 26).put("tag", "kotlin-v0.9.0-build.1")
-        .put("apk", JSONObject().put("name", "hongguotv-kotlin-0.9.0-build.1-android8.apk").put("size", bytes.size)
+        .put("versionCode", 10001).put("versionName", "0.9.0+1").put("minSdk", 21).put("tag", "kotlin-v0.9.0-build.1")
+        .put("apk", JSONObject().put("name", "hongguotv-kotlin-0.9.0-build.1-android5.apk").put("size", bytes.size)
             .put("sha256", MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }))
     private fun update() = AppUpdate.parse(json().toString())
     private fun withFile(block: (File) -> Unit) {
@@ -22,11 +22,21 @@ class AppUpdatesTest {
     }
     @Test fun onlyHigherCompatibleVersionsAreUpdates() {
         val update = update()
-        assertTrue(update.newerThan(9, 26)); assertFalse(update.newerThan(10001, 36)); assertFalse(update.newerThan(10002, 36)); assertFalse(update.newerThan(9, 25))
+        assertTrue(update.newerThan(9, 26)); assertFalse(update.newerThan(10001, 36)); assertFalse(update.newerThan(10002, 36)); assertFalse(update.newerThan(9, 20))
+    }
+    @Test fun acceptBothAndroid5AndAndroid8ApkNames() {
+        // 0.28.0 及更早的存量客户端只发布过 -android8.apk 清单，minSdk 下探后改用 -android5.apk；
+        // 解析必须两种后缀都收，否则总有一批存量客户端「更新信息格式不正确」
+        val old = json().put("minSdk", 26)
+        old.getJSONObject("apk").put("name", "hongguotv-kotlin-0.9.0-build.1-android8.apk")
+        assertEquals("hongguotv-kotlin-0.9.0-build.1-android8.apk", AppUpdate.parse(old.toString()).fileName)
+        assertEquals("hongguotv-kotlin-0.9.0-build.1-android5.apk", update().fileName)
+        val o = json(); o.getJSONObject("apk").put("name", "hongguotv-kotlin-0.9.0-build.1-android7.apk")
+        assertThrows(IllegalArgumentException::class.java) { AppUpdate.parse(o.toString()) }
     }
     @Test fun downloadUrlUsesOnlyFixedRepositoryAndValidatedNames() {
-        assertEquals("https://github.com/jycao2/hongguoTV/releases/download/kotlin-v0.9.0-build.1/hongguotv-kotlin-0.9.0-build.1-android8.apk", update().downloadUrl)
-        for (value in listOf("../../bad.apk", "evil.apk", "https://example.com/evil.apk", "hongguotv-kotlin-1/2-android8.apk")) {
+        assertEquals("https://github.com/jycao2/hongguoTV/releases/download/kotlin-v0.9.0-build.1/hongguotv-kotlin-0.9.0-build.1-android5.apk", update().downloadUrl)
+        for (value in listOf("../../bad.apk", "evil.apk", "https://example.com/evil.apk", "hongguotv-kotlin-1/2-android5.apk")) {
             val o = json(); o.getJSONObject("apk").put("name", value)
             assertThrows(IllegalArgumentException::class.java) { AppUpdate.parse(o.toString()) }
         }

@@ -1,6 +1,6 @@
 # 红果 TV
 
-自家电视使用的非官方红果短剧客户端，与红果官方无关联。**Kotlin 原生独立 APK**：安装后联网即可浏览播放，无需 Node / Docker / 服务器。最低 Android 8.0（API 26），电视遥控器操作，ARM32 / ARM64 / x86 / x86_64 通用。
+自家电视使用的非官方红果短剧客户端，与红果官方无关联。**Kotlin 原生独立 APK**：安装后联网即可浏览播放，无需 Node / Docker / 服务器。最低 Android 5.0（API 21），电视遥控器操作，ARM32 / ARM64 / x86 / x86_64 通用。
 
 **[下载最新版 APK](https://github.com/jycao2/hongguoTV/releases/latest)** · [手机遥控端](https://github.com/jycao2/hongguoTV-remote) · [问题反馈 / 提交 Issue](https://github.com/jycao2/hongguoTV-updates/issues) · [版本记录与构建说明](kotlin-tv/README.md) · [自动更新机制](kotlin-tv/AUTO_UPDATES.md)
 
@@ -38,7 +38,7 @@
 - `kotlin-tv/`：客户端工程（Kotlin + Android 原生 View + Media3），单测、构建与发布说明见其 README
 - `scripts/`：正式包构建与发布脚本
 - `deploy/`：匿名装机统计的云函数部署
-- `docs/`：接口研究、部署与历史交付资料
+- `docs/`：接口研究、部署与历史交付资料；版本改动见 [更新日志](docs/CHANGELOG.md)
 
 ## 配套仓库
 

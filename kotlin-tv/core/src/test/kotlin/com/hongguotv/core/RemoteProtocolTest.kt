@@ -22,6 +22,47 @@ class RemoteProtocolTest {
         assertEquals(RemoteCommand.Menu(true), parse("""{"cmd":"menu","long":true}"""))
         assertEquals(RemoteCommand.Detach, parse("""{"cmd":"detach"}"""))
         assertEquals(RemoteCommand.Search("总裁的替身新娘"), parse("""{"cmd":"search","query":"总裁的替身新娘"}"""))
+        assertEquals(RemoteCommand.Watch("黄石"), parse("""{"cmd":"watch","query":"黄石"}"""))
+        // 遥控页整句：可能是指令也可能是剧名，理解交给电视端
+        assertEquals(RemoteCommand.Say("检查有没有更新"), parse("""{"cmd":"say","text":"检查有没有更新"}"""))
+        assertNull("空句子不该被当成指令", parse("""{"cmd":"say","text":"   "}"""))
+        assertEquals(RemoteCommand.Open("source"), parse("""{"cmd":"open","module":"source"}"""))
+        // 大小写与两端空白由协议层吃掉，桥接那边不用自己归一
+        assertEquals(RemoteCommand.Open("rank"), parse("""{"cmd":"open","module":" RANK "}"""))
+    }
+
+    @Test fun `open only accepts whitelisted modules`() {
+        // 白名单外的键一律拒绝：界面层不该为一个不存在的页签做兜底
+        assertNull(parse("""{"cmd":"open","module":"porn"}"""))
+        assertNull(parse("""{"cmd":"open","module":""}"""))
+        assertNull(parse("""{"cmd":"open"}"""))
+        assertNull(parse("""{"cmd":"watch","query":""}"""))
+        assertNull(parse("""{"cmd":"watch","query":"${"x".repeat(81)}"}"""))
+        assertNull(parse("""{"cmd":"watch"}"""))
+    }
+
+    @Test fun `watch can carry an episode number`() {
+        // 说清集号才允许直接落到那一集；0 表示没说，界面只出搜索结果
+        assertEquals(RemoteCommand.Watch("文盲修仙", 7), parse("""{"cmd":"watch","query":"文盲修仙","episode":7}"""))
+        assertEquals(0, (parse("""{"cmd":"watch","query":"文盲修仙"}""") as RemoteCommand.Watch).episode)
+        assertNull("集号越界不该被夹到合法值", parse("""{"cmd":"watch","query":"x","episode":10000}"""))
+        assertNull(parse("""{"cmd":"watch","query":"x","episode":-1}"""))
+        assertNull(parse("""{"cmd":"watch","query":"x","episode":1.5}"""))
+    }
+
+    @Test fun `new acts validate their arguments at the edge`() {
+        assertEquals(RemoteCommand.Act("type.set", "short"), parse("""{"cmd":"act","id":"type.set","arg":"short"}"""))
+        assertEquals(RemoteCommand.Act("random.pick", ""), parse("""{"cmd":"act","id":"random.pick"}"""))
+        assertEquals(RemoteCommand.Act("sleep.set", "min:30"), parse("""{"cmd":"act","id":"sleep.set","arg":"min:30"}"""))
+        assertEquals(RemoteCommand.Act("volume.mute", "on"), parse("""{"cmd":"act","id":"volume.mute","arg":"on"}"""))
+        assertEquals(RemoteCommand.Act("player.close"), parse("""{"cmd":"act","id":"player.close"}"""))
+        // 参数校验：类型键、定时格式、静音参数都只收认识的值
+        assertNull(parse("""{"cmd":"act","id":"type.set","arg":"porn"}"""))
+        assertNull(parse("""{"cmd":"act","id":"type.set"}"""))
+        assertNull(parse("""{"cmd":"act","id":"sleep.set","arg":"min:0"}"""))
+        assertNull(parse("""{"cmd":"act","id":"sleep.set","arg":"30"}"""))
+        assertNull(parse("""{"cmd":"act","id":"volume.mute","arg":"maybe"}"""))
+        assertNull(parse("""{"cmd":"act","id":"nope"}"""))
     }
 
     @Test fun `out of range and malformed commands are rejected instead of clamped`() {

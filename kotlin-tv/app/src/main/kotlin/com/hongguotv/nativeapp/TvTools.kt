@@ -3,6 +3,7 @@ package com.hongguotv.nativeapp
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
@@ -10,6 +11,7 @@ import android.graphics.drawable.GradientDrawable
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
@@ -49,11 +51,19 @@ class TvTools(private val activity: Activity) {
     private fun dp(value: Int)=(value*activity.resources.displayMetrics.density).toInt()
     /** 当前可用的局域网 IPv4：只认 Wi-Fi / 有线，手机必须和电视在同一网段才能扫码。 */
     fun lanAddress(): String? {
-        val connectivity=activity.getSystemService(ConnectivityManager::class.java)
-        val network=connectivity.activeNetwork ?: return null
-        val capabilities=connectivity.getNetworkCapabilities(network) ?: return null
-        if(!(capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))) return null
-        return connectivity.getLinkProperties(network)?.linkAddresses?.map { it.address }?.firstOrNull { it is Inet4Address && it.isSiteLocalAddress }?.hostAddress
+        val connectivity=activity.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return null
+        if(Build.VERSION.SDK_INT>=23) {
+            val network=connectivity.activeNetwork ?: return null
+            val capabilities=connectivity.getNetworkCapabilities(network) ?: return null
+            if(!(capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))) return null
+            return connectivity.getLinkProperties(network)?.linkAddresses?.map { it.address }?.firstOrNull { it is Inet4Address && it.isSiteLocalAddress }?.hostAddress
+        }
+        // API 21/22 没有 Network API，改为直接枚举网卡上的局域网地址
+        return runCatching {
+            java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces()).asSequence()
+                .flatMap { it.inetAddresses.asSequence() }
+                .firstOrNull { it is Inet4Address && !it.isLoopbackAddress && it.isSiteLocalAddress }?.hostAddress
+        }.getOrNull()
     }
     private fun freeBytes()=runCatching { android.os.StatFs(activity.filesDir.absolutePath).availableBytes }.getOrDefault(0L)
     /** 快传落盘目录：都在 filesDir 下，卸载应用时随应用数据一起清除。 */
@@ -437,6 +447,29 @@ class TvTools(private val activity: Activity) {
         var sample=1
         while(bounds.outWidth/(sample*2)>=screen) sample*=2
         return BitmapFactory.decodeFile(file.absolutePath,BitmapFactory.Options().apply { inSampleSize=sample })
+    }
+    /**
+     * 语音「清空文件」：删掉快传目录里的成品文件，回报删了多少个、腾出多少字节。
+     *
+     * 这里不弹二次确认——话说出口就是确认，再让人摸遥控器按一次，语音入口就白做了。
+     * 删的只是手机传过来的文件，收藏、观看记录、已安装应用都不动。
+     *
+     * 先 [close]：面板上写着「本次已接收 N 个」，文件被别处删掉后那个数字就不实了，
+     * 留着比关掉更让人困惑。顺带把快传会话一起收掉，下次打开是一张新码。
+     */
+    fun clearQuickFiles(onDone: (count: Int,bytes: Long)->Unit) {
+        close()
+        worker.execute {
+            var count=0
+            var bytes=0L
+            quickDirectories().forEach { dir ->
+                dir.listFiles()?.filter { !it.name.endsWith(TransferRules.PART_SUFFIX) }?.forEach { file ->
+                    val size=if(file.isDirectory) 0L else file.length()
+                    if(runCatching { file.deleteRecursively() }.getOrDefault(false)) { count++; bytes+=size }
+                }
+            }
+            main.post { onDone(count,bytes) }
+        }
     }
     /** 已收文件列表：查看历史上传、按类型筛选、单条删除；确认键执行各类型的主操作。 */
     fun quickFiles(anchor: View?,onPrimary: (File,TransferKind)->Unit,onTransfer: ()->Unit,onClose: ()->Unit={}) {

@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
@@ -20,6 +21,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.widget.TextViewCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -62,6 +64,9 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         const val SOURCE_DISCLAIMER = "第三方 CMS 接口由用户自行添加，仅为技术交流与学习用途，应用不提供、不存储、不传播任何视频内容，内容合法性由对应源站负责。"
         /** 聚合搜索单次最多参与的源数：当前源优先，独立线程池并发，避免被慢源拖成多轮。 */
         const val AGGREGATE_LIMIT = 6
+
+        /** 聚合搜索总时限（毫秒）：超过就把未返回的源放弃，不等齐再展示。 */
+        const val AGGREGATE_TIMEOUT_MS = 8_000L
         /** 探活缓存有效期：30 分钟内的结果直接复用，冷启动不再全量请求。 */
         const val PROBE_TTL_MS = 30 * 60_000L
         /** 连续缓冲多少秒视为线路卡死：自动换线路，线路用尽再尝试其它片源。
@@ -130,6 +135,9 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
     private var searchSourceTotal = 0
     private val searchFailures = HashMap<String, String>()
     private var searchSeq = 0
+    // 聚合总时限：到点把没返回的源按「超时」记账直接收尾，已到的结果照常展示。
+    // 没有这个兜底时，一个挂起的源能让结果页永远停在「正在聚合 1/6」，33 条结果躺在内存里看不见。
+    private var searchTimeout: Runnable? = null
     private var searchAllOverride = false
     private var searchStatusView: TextView? = null
     // 搜索页（独立 Mode.SEARCH）：输入、联想、分页状态与浏览态结果分离
@@ -139,6 +147,10 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
     private var searchLoading = false
     private var searchLoadingMore = false
     private var searchRequested = false
+    /** 「一句话开播」待办关键字：搜索结果第一条到达就起播，只消费一次。 */
+    private var watchPending: String? = null
+    /** 待办里说清的集号（1 起），0 表示没说，按续播逻辑走。 */
+    private var watchPendingEpisode = 0
     private var searchPage = 1
     private var searchHasMore = false
     private var searchTotal = 0
@@ -159,6 +171,16 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
     private var detailSource: ThirdSource? = null
     private var detailGroup = 0
     private var synopsisExpanded = false
+    /** 系列剧：同片源内按「第N季」识别出的全部分季（含当前季）。异步查找，到位后原地插入不重建。 */
+    private var seriesKey = ""
+    private var seriesSeasons: List<ThirdDetail> = emptyList()
+    private var seriesRequested = false
+    private var seriesHost: LinearLayout? = null
+    /** 详情页焦点接线：系列条是异步插入的，接线必须能重算。 */
+    private var detailMainFocus: TextView? = null
+    private var detailTabButtons: List<TextView> = emptyList()
+    private var detailEpisodeGrid: RecyclerView? = null
+    private var detailSeriesChips: List<TextView> = emptyList()
 
     // ---- 收藏态 ----
     private var favoriteEntries: List<ThirdFavorite> = emptyList()
@@ -177,6 +199,10 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
     private var seekBarView: View? = null
     private var playTime: TextView? = null
     private var overlayVisible = false
+    /** 顶部信息条右侧的鼠标退出按钮：只在最近一次操作来自鼠标时出现，见 [TvPointer]。 */
+    private var exitPlayButton: View? = null
+    /** 最近一次操作是不是鼠标做的：遥控一按就翻回 false，按钮随之收起。 */
+    private var pointerSeen = false
     // 平滑快进快退：按住左右键时虚拟位置按节奏推进并实时渲染关键帧预览，松开才精确定位
     private var scrubbing = false
     /** ExoPlayer 最近一次带宽估计（bps）：缓冲提示用它显示实时网速。 */
@@ -332,6 +358,8 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
 
     /** 播放页按键接管；浏览态只接管网格上下翻行（RecyclerView 在固定高度容器里不会为焦点自动滚动）。 */
     fun onKey(event: KeyEvent): Boolean {
+        // 遥控一按就把鼠标专属的按钮收起来：最近一次操作已经换人了
+        if(pointerSeen && mode == Mode.PLAY) { pointerSeen = false; showExitForPointer() }
         if(event.action == KeyEvent.ACTION_DOWN && (mode == Mode.BROWSE || mode == Mode.HISTORY || mode == Mode.FAVORITE) && browseGridKey(event.keyCode)) return true
         // 历史/收藏页：菜单键删除当前聚焦的记录（遥控器长按行为不一致，这里用显式按键）
         if(event.action == KeyEvent.ACTION_DOWN && mode == Mode.HISTORY && event.keyCode == KeyEvent.KEYCODE_MENU) { deleteFocusedHistory(); return true }
@@ -490,7 +518,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
                 setPadding(dp(14), dp(8), dp(16), dp(8))
                 setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_search, 0, 0, 0)
                 compoundDrawablePadding = dp(6)
-                setCompoundDrawableTintList(ColorStateList.valueOf(TvStyle.accent))
+                TextViewCompat.setCompoundDrawableTintList(this, ColorStateList.valueOf(TvStyle.accent))
                 focusStyle(this)
                 setOnClickListener { openSearch() }
             }
@@ -1085,7 +1113,17 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         searchAggregate = candidates.size > 1
         searchSourceTotal = candidates.size
         searchAggregating = searchAggregate && candidates.size > 1
+        // 上一轮的超时兜底作废：换词/换源后序号会变，超时任务里有 seq 守卫，这里只是及时清句柄
+        searchTimeout?.let { main.removeCallbacks(it) }
+        searchTimeout = null
+        // 已返回的源记在这里，超时收尾时才能区分「慢源」和「真失败」
+        val arrived = HashSet<String>()
         var firstArrival = true
+        if(searchAggregating) {
+            val timeout = Runnable { finishAggregation(seq, candidates, arrived, timedOut = true) }
+            searchTimeout = timeout
+            main.postDelayed(timeout, AGGREGATE_TIMEOUT_MS)
+        }
         candidates.forEach { source ->
             searchExecutor.execute {
                 val result = client.searchPage(source.api, word, 1)
@@ -1094,6 +1132,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
                     // 若继续用它守卫，其余源的后续结果会被全部丢弃（状态永远停在 1/N）。
                     // 这里以序号 + 关键词为准，换源/重新搜索都会先改 searchWord。
                     if(seq != searchSeq || searchWord != word) return@post
+                    arrived.add(source.api)
                     searchSourcesDone++
                     val pageData = result.page
                     if(pageData == null) searchFailures[source.api] = result.error ?: "连接失败"
@@ -1108,12 +1147,10 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
                         }
                     }
                     val finished = searchSourcesDone >= candidates.size
+                    if(finished) finishAggregation(seq, candidates, arrived, timedOut = false)
+                    // 语音开播：第一条结果到手就起播，不等其余源聚合完成
+                    if(playPendingWatch()) return@post
                     searchLoading = !finished
-                    if(finished) {
-                        searchAggregating = false
-                        if(searchHits.isEmpty()) loadError = searchFailures.values.firstOrNull()?.let { "所有片源均未返回结果（$it）" }
-                            ?: "连接超时或接口无响应"
-                    }
                     // 首个结果到达才建网格；后续结果只刷新 adapter，避免整页重建抢走焦点
                     if(firstArrival || (gridAdapter == null && searchDetails.isNotEmpty())) { firstArrival = false; rebuild() }
                     else {
@@ -1126,9 +1163,46 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         }
     }
 
+    /**
+     * 聚合收尾：全部源返回，或总时限到了放弃慢源（[timedOut]）。
+     *
+     * 超时是把结果页从「永远在聚合」里救出来的兜底：慢源一挂几十秒，
+     * 已到的结果早就能看了，没理由陪它等。未返回的源逐个记「超时」，
+     * 顶部统计里和真失败一样能看出有几个源没响应。
+     *
+     * 收尾时若网格已建好就只刷状态文本，不整页重建——用户可能正在翻结果，
+     * 抢走焦点比晚几秒更新统计更糟。
+     */
+    private fun finishAggregation(seq: Int, candidates: List<ThirdSource>, arrived: Set<String>, timedOut: Boolean) {
+        if(seq != searchSeq) return
+        searchTimeout?.let { main.removeCallbacks(it) }
+        searchTimeout = null
+        searchAggregating = false
+        if(timedOut) {
+            candidates.filter { it.api !in arrived }.forEach { searchFailures[it.api] = "超时" }
+            searchSourcesDone = candidates.size
+        }
+        // 待办必须丢掉：收尾意味着这条语音命令的搜索已经结束，
+        // 不清掉的话下一次手动搜索的首条结果会被它误起播。
+        val missed = watchPending
+        watchPending = null
+        watchPendingEpisode = 0
+        searchLoading = false
+        if(searchHits.isEmpty()) {
+            loadError = searchFailures.values.firstOrNull()?.let { "所有片源均未返回结果（$it）" }
+                ?: "连接超时或接口无响应"
+        } else if(missed != null) {
+            // 有结果但没一个能播：留在结果页，让人自己点——这比替用户猜一个可靠。
+            Toast.makeText(activity, "没找到能播放的「$missed」，请从结果里选一个", Toast.LENGTH_SHORT).show()
+        }
+        if(gridAdapter != null) {
+            searchStatusView?.text = searchSummaryText()
+            gridStatus?.text = gridStatusText()
+        } else rebuild()
+    }
+
     /** 「仅当前源」分页追加。 */
-    private fun requestSearchMore(source: ThirdSource, word: String) {
-        if(searchLoadingMore || !searchHasMore) return
+    private fun requestSearchMore(source: ThirdSource, word: String) {        if(searchLoadingMore || !searchHasMore) return
         searchLoadingMore = true
         val seq = searchSeq
         val requestPage = searchPage + 1
@@ -2057,6 +2131,9 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         if(clean.isEmpty() || currentSource() == null) return
         main.removeCallbacks(suggestDebounce)
         searchWord = clean; searchInput = clean
+        // 手动发起的新搜索取消上一次没跑完的语音开播待办
+        watchPending = null
+        watchPendingEpisode = 0
         store.rememberSearch(clean)
         searchAllOverride = allSources
         searchDetails = emptyList(); searchHits = emptyList(); searchHitByVideoId.clear(); searchIndex.clear()
@@ -2101,12 +2178,24 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         autoFallbackGroups.clear()
         autoFallbackSources.clear()
         stallAdviceShown = false; sourceSwitchInFlight = false
+        // 换了一部片才重置系列剧状态：从系列条切到同系列另一季时沿用已找到的分季，区块不会闪一下再回来
+        val key = detailSource?.id.orEmpty() + "|" + data.video.id
+        if(key != seriesKey) {
+            if(seriesSeasons.none { it.video.id == data.video.id }) {
+                seriesSeasons = emptyList(); seriesHost = null
+            }
+            seriesKey = key
+        }
+        // 每次进详情允许重新查一次（上次网络失败可恢复）；客户端有缓存，成功过的几乎零成本
+        seriesRequested = false
         mode = Mode.DETAIL
         rebuild()
     }
 
     private fun renderDetail(container: LinearLayout) {
         val data = detail ?: run { mode = Mode.BROWSE; renderBrowse(container); return }
+        detailMainFocus = null; detailTabButtons = emptyList()
+        detailEpisodeGrid = null; detailSeriesChips = emptyList()
         val body = column()
 
         // 顶栏：返回按钮与片名同行、垂直居中对齐
@@ -2190,6 +2279,14 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         favoriteButton.nextFocusLeftId = start.id
         content.addView(mainActions)
 
+        // 系列剧条：同源同名分季（第二季/第三季…）。首次进详情异步查找，到位后原地插入，
+        // 不整页重建，避免用户正在翻集数时焦点被抢回主按钮
+        val seriesBox = column()
+        content.addView(seriesBox)
+        seriesHost = seriesBox
+        paintSeries(seriesBox, data)
+        if(!seriesRequested && seriesSeasons.none { it.video.id == data.video.id }) requestSeries(data)
+
         // 播放组 tabs：左右互连，向下进入分集网格；主按钮向下先落到第一个线路标签
         val tabButtons = mutableListOf<TextView>()
         if(data.groups.size > 1) {
@@ -2203,13 +2300,10 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
                 tabButtons += tab
             }
             content.addView(tabRow)
-            tabButtons.firstOrNull()?.let { tab ->
-                mainFocus?.nextFocusDownId = tab.id
-                tab.nextFocusUpId = mainFocus?.id ?: View.NO_ID
-            }
         }
 
         // 分集网格
+        var episodeGrid: RecyclerView? = null
         val episodes = data.groups.getOrNull(playGroup)?.second.orEmpty()
         if(episodes.isEmpty()) {
             content.addView(text("该线路暂无可用剧集", 14f, muted).apply { setPadding(0, dp(8), 0, 0) })
@@ -2226,10 +2320,14 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
                 } }
             }
             content.addView(recycler, lp(-1, -2))
-            // 有线路标签时向下从标签进网格，否则直接从主按钮进网格
-            if(tabButtons.isEmpty()) mainFocus?.nextFocusDownId = recycler.id
-            else tabButtons.forEach { it.nextFocusDownId = recycler.id }
+            episodeGrid = recycler
         }
+
+        // 焦点接线统一在这里做：主按钮 → 系列剧 → 线路 → 分集网格，三段任一缺失都自动跳过
+        detailMainFocus = mainFocus
+        detailTabButtons = tabButtons
+        detailEpisodeGrid = episodeGrid
+        wireDetailFocus()
 
         body.addView(scroll, lp(-1, 0).apply { weight = 1f })
         container.addView(body, lp(-1, 0).apply { weight = 1f })
@@ -2240,6 +2338,77 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
 
     private fun renderDetailRefresh() {
         if(mode == Mode.DETAIL) rebuild()
+    }
+
+    /** 系列剧条：当前季高亮，其它季标注已有进度；点一下切到那一季（详情由同一片源的搜索结果直接带回）。 */
+    private fun paintSeries(host: LinearLayout, data: ThirdDetail) {
+        host.removeAllViews()
+        detailSeriesChips = emptyList()
+        val seasons = seriesSeasons
+        if(seasons.size < 2) { wireDetailFocus(); return }
+        val heading = row()
+        heading.addView(text("系列剧", 13f, TvStyle.accent), lp(-2, -2))
+        heading.addView(text("共 ${seasons.size} 季 · 左右切换", 12f, muted).apply { setPadding(dp(8), 0, 0, 0) }, lp(-2, -2))
+        host.addView(heading, lp(-1, -2).apply { topMargin = dp(2); bottomMargin = dp(6) })
+
+        val strip = HorizontalScrollView(activity).apply { isHorizontalScrollBarEnabled = false; clipToPadding = false }
+        val line = row()
+        strip.addView(line)
+        val chips = mutableListOf<TextView>()
+        seasons.forEach { season ->
+            val current = season.video.id == data.video.id
+            val number = ThirdCms.seriesNumber(season.video.name)
+            val label = if(number == Int.MAX_VALUE) season.video.name.take(12) else "第 $number 季"
+            val seen = if(current) "" else store.progress(detailSource?.id.orEmpty(), season.video.id)
+                ?.let { " · 看到第${it.episode + 1}集" }.orEmpty()
+            val chip = addButton(line, label + seen, current) { if(!current) openDetail(season, detailSource) }
+            if(current) chip.setTextColor(TvStyle.accent)
+            chips += chip
+        }
+        host.addView(strip, lp(-1, -2))
+        detailSeriesChips = chips
+        wireDetailFocus()
+    }
+
+    /** 系列剧查找：用去掉季号的主名在同一片源里搜一次（客户端 10 分钟内复用），
+     *  结果自带播放地址，切季无需二次请求。失败或没有其它季时静静不显示，绝不影响详情渲染。 */
+    private fun requestSeries(data: ThirdDetail) {
+        val source = detailSource ?: return
+        val base = ThirdCms.seriesBase(data.video.name)
+        if(base.isEmpty()) return
+        val gen = generation
+        val key = seriesKey
+        seriesRequested = true
+        executor.execute {
+            val picked = try {
+                ThirdCms.series(data, client.seriesCandidates(source.api, base))
+            } catch(_: Exception) { emptyList() }
+            main.post {
+                if(gen != generation || key != seriesKey) return@post
+                seriesSeasons = picked
+                val host = seriesHost ?: return@post
+                if(detail?.video?.id != data.video.id || host.parent == null) return@post
+                paintSeries(host, data)
+            }
+        }
+    }
+
+    /** 详情页焦点接线：主按钮 → 系列剧 → 线路 → 分集网格。系列条异步插入，所以每次变化都重算一遍。 */
+    private fun wireDetailFocus() {
+        val main = detailMainFocus ?: return
+        val chips = detailSeriesChips
+        val tabs = detailTabButtons
+        val grid = detailEpisodeGrid
+        val firstTab = tabs.firstOrNull()
+        main.nextFocusDownId = chips.firstOrNull()?.id ?: firstTab?.id ?: grid?.id ?: View.NO_ID
+        chips.forEachIndexed { index, chip ->
+            chip.nextFocusLeftId = chips.getOrNull(index - 1)?.id ?: View.NO_ID
+            chip.nextFocusRightId = chips.getOrNull(index + 1)?.id ?: View.NO_ID
+            chip.nextFocusUpId = main.id
+            chip.nextFocusDownId = firstTab?.id ?: grid?.id ?: View.NO_ID
+        }
+        firstTab?.nextFocusUpId = chips.lastOrNull()?.id ?: main.id
+        tabs.forEach { it.nextFocusDownId = grid?.id ?: View.NO_ID }
     }
 
     /** 详情页收藏/取消收藏：只记录影片与来源源，随主备份迁移。 */
@@ -2473,7 +2642,27 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         instance.playWhenReady = autoplay
 
         player = instance; playerHost = host
+        // 播放页鼠标手势：单击呼出/收起控制层，右键退出回详情。
+        // 顶层挂 touch，控制层里的按钮（子 view）优先收到事件，互不打架。
+        val tapGestures = android.view.GestureDetector(activity, object : android.view.GestureDetector.SimpleOnGestureListener() {
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                if(overlayVisible) hideOverlay() else showOverlay()
+                return true
+            }
+        })
+        host.setOnTouchListener { _, e ->
+            if(mode != Mode.PLAY) return@setOnTouchListener false
+            // 鼠标点一下记住来源：退出按钮与控制层的手势提示跟着出现
+            if(TvPointer.isPointer(e) && !pointerSeen) { pointerSeen = true; showExitForPointer() }
+            if(e.actionMasked == MotionEvent.ACTION_DOWN && (e.buttonState and MotionEvent.BUTTON_SECONDARY) != 0) {
+                onBack()
+                return@setOnTouchListener true
+            }
+            tapGestures.onTouchEvent(e)
+        }
         buildOverlay(host, data, group.first)
+        // 鼠标一动就把退出按钮放出来；遥控一按（见 onKey）再收回去
+        TvPointer.onHover(host) { if(!pointerSeen) { pointerSeen = true; showExitForPointer() } }
         (activity.findViewById(android.R.id.content) as FrameLayout).addView(host, FrameLayout.LayoutParams(-1, -1))
         scheduleSave()
         // 缓冲看门狗：打开任何一集都启动，长时间卡在缓冲时自动换线路/换源
@@ -2489,6 +2678,17 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         }
         topBar.addView(text("${data.video.name} · ${data.groups.getOrNull(playGroup)?.second?.getOrNull(playEpisode)?.label.orEmpty()}", 15f), lp(0, -2).apply { weight = 1f })
         topBar.addView(text("${detailSource?.name.orEmpty()} · $groupName", 12f, muted))
+        // 插着鼠标的人下意识想到「点右上角关掉」；遥控用户仍按返回键。
+        // 默认收起，鼠标真的动了/点了才放出来——遥控用户看到点不到的按钮只会更困惑。
+        val exitPlay = text("✕ 退出", 13f).apply {
+            isFocusable = false; isClickable = true
+            setPadding(dp(12), dp(4), dp(12), dp(4))
+            background = rounded(Color.argb(90, 0, 0, 0), radius = 8)
+            setOnClickListener { onBack() }
+            visibility = View.GONE
+        }
+        exitPlayButton = exitPlay
+        topBar.addView(exitPlay, lp(-2, -2).apply { leftMargin = dp(12) })
         topBar.visibility = View.GONE
         host.addView(topBar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
 
@@ -2521,6 +2721,22 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
             thumb.visibility = if(focused) View.VISIBLE else View.GONE
             bubble.visibility = if(focused) View.VISIBLE else View.INVISIBLE
             if(focused) updatePlayUi()
+        }
+        // 鼠标 / 触摸拖动定位：按住就跟手（只动气泡与时间），松手才真正 seek。
+        // 遥控用户的左右键路径完全不变，两条输入各走各的。
+        seekBar.setOnTouchListener { view, event ->
+            when(event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    if(!overlayVisible) showOverlay(focusButtons = false)
+                    main.removeCallbacks(hideOverlayRun)
+                    thumb.visibility = View.VISIBLE
+                    touchScrub(event.x, view.width)
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> { touchScrub(event.x, view.width); true }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { endTouchScrub(); true }
+                else -> false
+            }
         }
         bottom.addView(seekBar, lp(-1, -2))
         val controls = row().apply { setPadding(0, dp(8), 0, 0) }
@@ -2580,6 +2796,28 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         1 -> AspectRatioFrameLayout.RESIZE_MODE_FILL
         2 -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
         else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+    }
+
+    /** 鼠标/触摸在进度条上拖动：按下即计算落点，拖动只更新气泡与时间，不逐帧 seek。 */
+    private fun touchScrub(x: Float, width: Int) {
+        val instance = player ?: return
+        val duration = instance.duration
+        if(duration <= 0 || width <= 0) return
+        val ratio = (x / width).coerceIn(0f, 1f)
+        scrubPositionMs = (duration * ratio).toLong()
+        scrubbing = true
+        updatePlayUi()
+    }
+
+    /** 松手：落到拖动位置（精确 seek），恢复控制层的自动收起计时。 */
+    private fun endTouchScrub() {
+        if(!scrubbing) return
+        scrubbing = false
+        val instance = player ?: return
+        instance.seekTo(scrubPositionMs.coerceIn(0L, instance.duration.takeIf { it > 0 } ?: Long.MAX_VALUE))
+        updatePlayUi()
+        main.removeCallbacks(hideOverlayRun)
+        main.postDelayed(hideOverlayRun, 6_000L)
     }
 
     /** 开始平滑快进/快退：暂停声音、只跳关键帧做画面预览，由节奏器按爬坡步长推进。 */
@@ -2694,8 +2932,14 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         }
     }
 
+    /** 鼠标专属的入口只跟最近一次操作来源有关，与电视上插着什么设备无关。 */
+    private fun showExitForPointer() {
+        exitPlayButton?.visibility = if(pointerSeen) View.VISIBLE else View.GONE
+    }
+
     private fun showOverlay(focusButtons: Boolean = true) {
         overlayVisible = true
+        showExitForPointer()
         overlayTopView?.visibility = View.VISIBLE
         overlay?.visibility = View.VISIBLE
         updatePlayUi()
@@ -2813,6 +3057,91 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
                 playEpisode(group, progress?.episode ?: 0, progress?.positionMs ?: 0L)
             }
         }
+        return true
+    }
+
+    /**
+     * 语音「清空搜索历史」：片源侧的搜索词一起清掉。
+     *
+     * 主站和片源各存一份历史，人不会记得自己是在哪一侧搜的，所以两条语音动作落下来
+     * 都会把两边都清掉（见 MainActivity 的 `history.clear`）。停在搜索页就顺手重绘，
+     * 让左栏那几行当场消失——说了清空还留着，比没说更让人怀疑没执行。
+     */
+    fun remoteClearSearches(): Boolean {
+        store.clearSearches()
+        if(mode == Mode.SEARCH) rebuild()
+        return true
+    }
+
+    /**
+     * 遥控搜片：只把片源的聚合搜索结果摆出来，不起播。
+     *
+     * 和主站搜索同一条规矩——结果里混着预告和空壳条目，替用户挑一个的代价就是播错。
+     * 没配源时返回 false，让主站搜索兜底。
+     */
+    fun remoteSearchTitle(word: String): Boolean {
+        if(currentSource() == null) return false
+        if(mode == Mode.PLAY) { saveProgressNow(); releasePlayback() }
+        submitSearch(word)
+        return true
+    }
+
+    /**
+     * 「一句话开播」：按片名搜当前片源，命中就直接进播放器（有进度就续播）。
+     *
+     * 只有两种调用者：说清了集号的语音（[episode] > 0），以及小爱「主题昵称就是剧名」那条老路。
+     * 普通搜剧名走 [remoteSearchTitle]，别替人挑。
+     *
+     * 不自己再发一次搜索：片源的聚合搜索本来就会把首个返回的源结果落到 [searchDetails]，
+     * 两边同时请求既浪费一次往返，也会和模块自己的 rebuild 抢时序（结果回来时人已经在播放页，
+     * 又被搜索页盖回去）。这里只挂一个待办关键字，由搜索结果到达的路径接手。
+     */
+    fun remotePlayTitle(word: String, episode: Int = 0): Boolean {
+        if(currentSource() == null) {
+            Toast.makeText(activity, "先选一个片源，再搜「$word」", Toast.LENGTH_SHORT).show()
+            return false
+        }
+        if(mode == Mode.PLAY) { saveProgressNow(); releasePlayback() }
+        submitSearch(word)
+        // 必须放在 submitSearch 之后：新版搜索会清掉上一次没跑完的待办
+        watchPending = word
+        watchPendingEpisode = episode
+        return true
+    }
+
+    /** 结果到达后的「一句话开播」接手点。返回 true 表示已接管，调用方别再重建搜索页。 */
+    private fun playPendingWatch(): Boolean {
+        val word = watchPending ?: return false
+        if(searchDetails.isEmpty()) return false
+        // 只从「真的有正片」的条目里挑：片源搜索结果里常有只有简介、没有分集的空壳，
+        // 挑中它进播放器就是一个没有内容的播放器。挑不到就留在结果页让人自己点，
+        // 待办也先留着——另一个源可能马上返回同一部片且带正片。
+        val picked = ThirdCms.pickBest(word, searchDetails.filter { detail -> detail.groups.any { it.second.isNotEmpty() } })
+            ?: return false
+        val wantEpisode = watchPendingEpisode
+        watchPending = null
+        watchPendingEpisode = 0
+        // 接管后把在途的聚合搜索作废：否则剩余源陆续返回还会 rebuild 一次搜索页，把人从播放器顶回去
+        searchSeq++
+        searchLoading = false; searchRequested = false; searchAggregating = false
+        // 命中项可能来自其它源（聚合搜索），起播要用它自己的 source
+        val hit = searchHits.firstOrNull { it.detail.video.id == picked.video.id }
+        val source = hit?.source ?: currentSource()
+        openDetail(picked, source)
+        val group = ThirdCms.defaultGroupIndex(picked.groups)
+        detailReturnMode = Mode.BROWSE
+        if(wantEpisode > 0) {
+            val count = picked.groups.getOrNull(group)?.second?.size ?: 0
+            if(wantEpisode > count) {
+                Toast.makeText(activity, "「${picked.video.name}」只有 $count 集", Toast.LENGTH_SHORT).show()
+                return true
+            }
+            playEpisode(group, wantEpisode - 1, 0L)
+            return true
+        }
+        val progress = store.progress(source?.id.orEmpty(), picked.video.id)
+        val resumeGroup = progress?.group?.takeIf { picked.groups.getOrNull(it) != null } ?: group
+        playEpisode(resumeGroup, progress?.episode ?: 0, progress?.positionMs ?: 0L)
         return true
     }
 
@@ -2973,7 +3302,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         setOnFocusChangeListener { _, focused ->
             background = rounded(if(focused) TvStyle.raised else TvStyle.surface, if(focused) TvStyle.accent else TvStyle.outline)
             if(focused) {
-                val manager = activity.getSystemService(InputMethodManager::class.java)
+                val manager = activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager
                 manager?.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
             }
         }
