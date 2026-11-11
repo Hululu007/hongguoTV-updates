@@ -785,7 +785,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         val source = currentSource() ?: return
         val gen = generation
         executor.execute {
-            val result = client.detail(source.api, video.id)
+            val result = client.detail(source, video.id)
             main.post {
                 if(gen != generation || result == null) {
                     if(gen == generation) Toast.makeText(activity, "获取详情失败，请重试", Toast.LENGTH_SHORT).show()
@@ -854,7 +854,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         if(entry.completed) store.clearProgress(source.id, entry.videoId)
         val gen = generation
         executor.execute {
-            val result = client.detail(source.api, entry.videoId)
+            val result = client.detail(source, entry.videoId)
             main.post {
                 if(gen != generation) return@post
                 if(result != null) { detailReturnMode = Mode.HISTORY; openDetail(result, source) } else showHistoryMissing(entry, source)
@@ -969,7 +969,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         }
         val gen = generation
         executor.execute {
-            val result = client.detail(source.api, entry.videoId)
+            val result = client.detail(source, entry.videoId)
             main.post {
                 if(gen != generation) return@post
                 if(result != null) { detailReturnMode = Mode.FAVORITE; openDetail(result, source) }
@@ -1058,17 +1058,17 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         executor.execute {
             // 分类与列表串行请求、统一一次回调：分类中途 rebuild 会让 generation 失效，
             // 导致 list 回调被丢弃、loading 死锁（点分类后界面卡死）
-            val fetched = if(reset && !categoriesCached && requestCategory == null) client.categories(source.api) else null
-            val result = client.list(source.api, requestCategory, requestPage)
+            val fetched = if(reset && !categoriesCached && requestCategory == null) client.categories(source) else null
+            val result = client.list(source, requestCategory, requestPage)
             main.post {
                 if(gen != generation) return@post
-                if(fetched != null && fetched.isNotEmpty()) { categories = fetched; categoriesCached = true }
+                if(fetched != null && fetched.isNotEmpty()) { categories = ThirdCms.filterCategories(source, fetched); categoriesCached = true }
                 if(reset) {
                     loading = false
                     if(result != null) {
                         // 分类兜底：仅首页响应含分类时更新缓存，后续页沿用
                         if(!categoriesCached && result.categories.isNotEmpty()) {
-                            categories = result.categories; categoriesCached = true
+                            categories = ThirdCms.filterCategories(source, result.categories); categoriesCached = true
                         }
                         videos = result.videos.toMutableList()
                         hasMore = result.hasMore && result.videos.isNotEmpty(); loadError = null; page = 1
@@ -1106,8 +1106,8 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         searchSourcesDone = 0
         val aggregate = searchAllOverride || store.searchAllSources
         val candidates = if(aggregate) {
-            // 当前源优先，跳过已知不可用的源，最多并发聚合 6 个（复用 3 线程池）
-            val others = sources.filter { it.id != current.id && probes[it.id]?.dot != Dot.DEAD }
+            // 当前源优先，跳过已知不可用与配置为不可搜索（searchable=false）的源，最多并发聚合 6 个（复用 3 线程池）
+            val others = sources.filter { it.id != current.id && it.searchable && probes[it.id]?.dot != Dot.DEAD }
             (listOf(current) + others).take(AGGREGATE_LIMIT)
         } else listOf(current)
         searchAggregate = candidates.size > 1
@@ -1126,7 +1126,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         }
         candidates.forEach { source ->
             searchExecutor.execute {
-                val result = client.searchPage(source.api, word, 1)
+                val result = client.searchPage(source, word, 1)
                 main.post {
                     // 不用 generation：首个结果到达会 rebuild 一次，generation 随之变化，
                     // 若继续用它守卫，其余源的后续结果会被全部丢弃（状态永远停在 1/N）。
@@ -1207,7 +1207,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         val seq = searchSeq
         val requestPage = searchPage + 1
         executor.execute {
-            val result = client.searchPage(source.api, word, requestPage)
+            val result = client.searchPage(source, word, requestPage)
             main.post {
                 if(seq != searchSeq || searchWord != word) return@post
                 searchLoadingMore = false
@@ -1382,7 +1382,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
                 probes[source.id] = ProbeState(Dot.RUNNING, 0)
                 val gen = generation
                 probeExecutor.execute {
-                    val result = client.probe(source.api)
+                    val result = client.probe(source)
                     store.saveProbe(source.api, ThirdProbeRecord(result.ok, result.total, result.reason, System.currentTimeMillis()))
                     main.post {
                         if(gen != generation) return@post
@@ -1454,7 +1454,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
             var bestMs = Long.MAX_VALUE
             sources.forEach { source ->
                 val started = android.os.SystemClock.elapsedRealtime()
-                val result = client.probe(source.api)
+                val result = client.probe(source)
                 val cost = android.os.SystemClock.elapsedRealtime() - started
                 main.post {
                     if(gen != generation) return@post
@@ -1612,7 +1612,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         val gen = generation
         probeExecutor.execute {
             val started = android.os.SystemClock.elapsedRealtime()
-            val result = client.probe(source.api)
+            val result = client.probe(source)
             val cost = android.os.SystemClock.elapsedRealtime() - started
             main.post {
                 if(gen != generation) return@post
@@ -1747,7 +1747,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         val urlEdit = editText("TVBox 配置链接（明文 JSON）")
         val errorText = text("", 13f, TvStyle.accent).apply { setPadding(0, dp(6), 0, 0) }
         form.addView(urlEdit); form.addView(errorText)
-        form.addView(text("自动跳过 spider jar（type=0）与加密 app 源（type=3/4）。", 12f, muted).apply { setPadding(0, dp(6), 0, 0) })
+        form.addView(text("支持 CMS JSON（type=1）与 XML（type=0）源，自动跳过 spider jar（type=3）与 JS/app 源（type=4）。", 12f, muted).apply { setPadding(0, dp(6), 0, 0) })
         val actions = row().apply { setPadding(0, dp(12), 0, 0) }
         lateinit var dialog: AlertDialog
         val parse = TvDialog.capsuleButton(activity, "解析") { }
@@ -1879,7 +1879,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
             if(existing[index]) return@forEachIndexed
             val gen = generation
             executor.execute {
-                val probe = client.probe(site.api)
+                val probe = client.probe(site.api, site.headers, site.timeoutSeconds, site.type)
                 main.post {
                     if(gen != generation) return@post
                     statusViews[index]?.let { view ->
@@ -1906,7 +1906,8 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
                 room <= 0 -> {}
                 else -> {
                     val id = "u" + site.api.hashCode().toUInt().toString()
-                    added += ThirdSource(id, site.name, site.api)
+                    added += ThirdSource(id, site.name, site.api, site.headers, site.type, site.searchable, site.quickSearch,
+                        site.filterable, site.categories, site.timeoutSeconds)
                     existingApis += site.api; room--; imported++
                 }
             }
@@ -2112,11 +2113,13 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
     /** 联想请求：300ms 防抖 + 序号守卫（只接受最新输入的结果），接口不支持或失败时静默为空。 */
     private fun runSuggest() {
         val source = currentSource() ?: return
+        // 源配置 quickSearch=false：输入即搜的快速通道不适用，联想直接为空（整词搜索仍可用）
+        if(!source.quickSearch) { suggestions = emptyList(); renderSuggestions(); return }
         val word = searchInput.trim()
         val seq = ++suggestSeq
         if(word.isEmpty()) { suggestions = emptyList(); renderSuggestions(); return }
         executor.execute {
-            val list = client.suggest(source.api, word)
+            val list = client.suggest(source, word)
             main.post {
                 if(seq != suggestSeq) return@post
                 suggestions = list
@@ -2381,7 +2384,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         seriesRequested = true
         executor.execute {
             val picked = try {
-                ThirdCms.series(data, client.seriesCandidates(source.api, base))
+                ThirdCms.series(data, client.seriesCandidates(source, base))
             } catch(_: Exception) { emptyList() }
             main.post {
                 if(gen != generation || key != seriesKey) return@post
@@ -2443,7 +2446,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         val episode = playEpisode
         Toast.makeText(activity, "正在「${target.name}」查找《${data.video.name}》…", Toast.LENGTH_SHORT).show()
         executor.execute {
-            val result = client.searchPage(target.api, data.video.name, 1)
+            val result = client.searchPage(target, data.video.name, 1)
             main.post {
                 if(gen != generation) return@post
                 val key = ThirdCms.searchKey(data.video.name, data.year)
@@ -2541,7 +2544,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         executor.execute {
             var found: ThirdSearchHit? = null
             for(target in targets) {
-                val details = client.searchPage(target.api, data.video.name, 1).page?.details.orEmpty()
+                val details = client.searchPage(target, data.video.name, 1).page?.details.orEmpty()
                 val matched = details.firstOrNull { ThirdCms.searchKey(it.video.name, it.year) == key }
                     ?: details.firstOrNull()
                 if(matched != null && matched.groups.any { it.second.isNotEmpty() }) { found = ThirdSearchHit(target, matched); break }
@@ -2595,12 +2598,14 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         host.addView(center, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
         playLoading = loading; playErrorText = errorView
 
-        // 三方源多为小站 CDN，默认 UA 与超时容易连不上：统一用浏览器 UA 并放宽超时
+        // 三方源多为小站 CDN，默认 UA 与超时容易连不上：统一用浏览器 UA 并放宽超时；
+        // 源自带专用 header（TVBox site.header）时逐条覆盖——防盗链/UA 校验的站靠它接通
         val httpFactory = DefaultHttpDataSource.Factory()
             .setUserAgent("Mozilla/5.0 (Linux; Android 10; TV) AppleWebKit/537.36")
             .setConnectTimeoutMs(15_000)
             .setReadTimeoutMs(20_000)
             .setAllowCrossProtocolRedirects(true)
+            .setDefaultRequestProperties(detailSource?.headers.orEmpty())
         // 慢/抖动链路策略：尽量多缓冲，且卡过后要攒够 25 秒再续播，
         // 避免带宽在码率边缘波动时频繁出现「缓冲→播几秒→再缓冲」
         val loadControl = DefaultLoadControl.Builder()
@@ -3043,7 +3048,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         if(entry.completed) store.clearProgress(source.id, entry.videoId)
         val gen = generation
         executor.execute {
-            val result = client.detail(source.api, entry.videoId)
+            val result = client.detail(source, entry.videoId)
             main.post {
                 if(gen != generation) return@post
                 val data = result ?: run {

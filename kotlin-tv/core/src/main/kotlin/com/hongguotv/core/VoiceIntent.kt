@@ -41,7 +41,7 @@ object VoiceIntent {
      */
     private val RULES: List<Rule> = listOf(
         // 版本与更新
-        Rule(listOf("有没有新版本", "有没有新版", "有没有更新", "检查版本", "检查更新", "看看更新", "看看有没有新版", "版本更新", "是不是最新版", "升级版本"),
+        Rule(listOf("有没有新版本", "有没有新版", "有没有更新", "检查版本", "检查更新", "看看更新", "看看有没有新版", "版本更新", "是不是最新版", "升级版本", "版本升级"),
             RemoteCommand.Act("update.check"), "正在检查新版本"),
         // 主题
         Rule(listOf("切换主题", "换主题", "换个主题", "切换风格", "换风格", "换个风格", "主题切换"),
@@ -53,13 +53,28 @@ object VoiceIntent {
         // 外观与界面
         Rule(listOf("显示时间", "显示时钟", "时间显示", "顶栏时间"),
             RemoteCommand.Act("clock.toggle"), "已切换时间显示"),
+        // 网速：显式「打开/关闭」必须落到 set，不能再用切换——已经开着时说「打开网速」
+        // 反而被关掉，是最容易挨骂的一种反馈。只说「切换网速」才走 toggle。
+        Rule(listOf("隐藏网速显示", "关闭网速显示", "关掉网速显示", "隐藏网速", "关闭网速", "关掉网速"),
+            RemoteCommand.Act("netspeed.set", "off"), "网速显示已关闭"),
+        Rule(listOf("打开网速显示", "显示网速悬浮条", "显示网速", "打开网速", "开启网速"),
+            RemoteCommand.Act("netspeed.set", "on"), "网速显示已打开"),
+        Rule(listOf("切换网速", "网速显示", "网速悬浮条"),
+            RemoteCommand.Act("netspeed.toggle"), "已切换网速显示"),
         Rule(listOf("恢复默认背景", "默认背景", "恢复背景"),
             RemoteCommand.Act("backdrop.reset"), "已恢复默认背景"),
+        // 全屏预览浮动条上的「设为电视背景」：取最近一张快传图片，一句话直接生效
+        Rule(listOf("把快传图片设为背景", "用快传图片做背景", "快传图片做背景", "设置电视背景", "设为电视背景"),
+            RemoteCommand.Act("backdrop.set"), "已设置电视背景"),
         // 关弹窗。必须和「关弹幕」严格分开：两者只差一个字，早先没有这条规则时
         // 「关闭弹窗」被模糊匹配吃成了切弹幕——喊关窗口结果把字幕评论开了。
         Rule(listOf("关闭弹窗", "关掉弹窗", "关弹窗", "关闭弹框", "关掉弹框", "关弹框",
             "关闭窗口", "关掉窗口", "关窗口", "关闭对话框", "关掉对话框", "关闭提示框"),
             RemoteCommand.Act("dialog.close"), "关闭弹窗"),
+        // 确认最上层弹窗：手机遥控上传的「接收 N 个文件」、安装 APK、设为背景都走这一句。
+        // 没有弹窗时返回 false，让语音层兜底，不对着空气点确认。
+        Rule(listOf("确认接收", "同意接收", "确定接收", "点击确认", "按下确认", "确认执行", "确认操作", "点确认"),
+            RemoteCommand.Act("dialog.confirm"), "已确认"),
         // 播放偏好
         Rule(listOf("自动连播", "自动播放下一集", "播完自动下一集"),
             RemoteCommand.Act("autonext.toggle"), "已切换自动连播"),
@@ -70,19 +85,19 @@ object VoiceIntent {
         Rule(listOf("自动跳过", "跳过不兼容"),
             RemoteCommand.Act("autoskip.toggle"), "已切换自动跳过"),
         // 播放控制
-        Rule(listOf("下一集", "放下一集", "换下一集"),
+        Rule(listOf("下一集", "放下一集", "换下一集", "下一话", "切到下一集"),
             RemoteCommand.Act("play.next"), "下一集"),
-        Rule(listOf("上一集", "回上一集", "放上一集"),
+        Rule(listOf("上一集", "回上一集", "放上一集", "上一话", "切到上一集"),
             RemoteCommand.Act("play.prev"), "上一集"),
-        Rule(listOf("从头播放", "从头看", "重新播放", "重播这一集", "重新开始"),
+        Rule(listOf("从头播放", "从头看", "重新播放", "重播这一集", "重新开始", "再放一遍"),
             RemoteCommand.Act("play.replay"), "从头播放"),
-        Rule(listOf("退出播放", "退出播放器", "关掉播放", "关闭播放", "退出观看", "回到详情", "回到详情页"),
+        Rule(listOf("退出播放", "退出播放器", "关掉播放", "关闭播放", "退出观看", "回到详情", "回到详情页", "不看了", "关闭视频"),
             RemoteCommand.Act("player.close"), "退出播放"),
         Rule(listOf("打开选集", "选集面板", "换一集", "看看选集", "选集"),
             RemoteCommand.Act("panel.episodes"), "选集"),
         Rule(listOf("跳过片头", "片头跳过"),
             RemoteCommand.Act("skip.intro"), "跳过片头"),
-        Rule(listOf("暂停", "停一下", "先停", "别放了"),
+        Rule(listOf("暂停", "停一下", "先停", "别放了", "停止播放"),
             RemoteCommand.Act("play.toggle"), "已暂停"),
         Rule(listOf("继续播放", "接着放", "恢复播放", "继续"),
             RemoteCommand.Act("play.toggle"), "继续播放"),
@@ -92,19 +107,25 @@ object VoiceIntent {
         Rule(listOf("慢一点", "慢一些", "放慢播放", "播放慢点", "减速播放"),
             RemoteCommand.Act("speed.down"), "倍速放慢"),
         // 继续观看
-        Rule(listOf("接着看", "继续看", "继续观看", "上次看到哪", "没看完的", "看到哪了"),
+        Rule(listOf("接着看", "继续看", "继续观看", "上次看到哪", "没看完的", "看到哪了", "接着上次的", "上次那个", "上次看的那部"),
             RemoteCommand.Act("resume.latest"), "继续上次观看"),
         // 详情页
-        Rule(listOf("收藏这个", "收藏它", "收藏当前", "加收藏", "取消收藏", "收藏一下"),
+        Rule(listOf("收藏这个", "收藏它", "收藏当前", "加收藏", "取消收藏", "收藏一下", "收藏这部剧"),
             RemoteCommand.Act("favorite.toggle"), "已切换收藏"),
+        // 收藏更新：收藏的剧有新集时，收藏页角标会亮；这条让语音也能主动查一次
+        Rule(listOf("检查收藏更新", "看看收藏有没有更新", "收藏有没有更新", "检查收藏", "收藏更新"),
+            RemoteCommand.Act("favorite.check"), "正在检查收藏更新"),
+        // 播放快捷面板：清晰度/倍速/弹幕/更多四列，改动立即生效
+        Rule(listOf("播放设置", "快捷面板", "播放面板", "打开播放设置", "播放快捷面板"),
+            RemoteCommand.Act("panel.quick"), "播放快捷面板"),
         // 音量：走系统媒体音量，不依赖播放器是否在跑
-        Rule(listOf("声音大一点", "音量大一点", "音量调大", "声音调大", "大声一点", "大声点", "声音大点", "大点声"),
+        Rule(listOf("声音大一点", "音量大一点", "音量调大", "声音调大", "大声一点", "大声点", "声音大点", "大点声", "音量加大", "调大声", "声音开大"),
             RemoteCommand.Act("volume.up"), "音量调大"),
-        Rule(listOf("声音小一点", "音量小一点", "音量调小", "声音调小", "小声一点", "小声点", "声音小点", "小点声"),
+        Rule(listOf("声音小一点", "音量小一点", "音量调小", "声音调小", "小声一点", "小声点", "声音小点", "小点声", "音量减小", "调小声"),
             RemoteCommand.Act("volume.down"), "音量调小"),
         Rule(listOf("取消静音", "解除静音", "打开声音", "关掉静音"),
             RemoteCommand.Act("volume.mute", "off"), "取消静音"),
-        Rule(listOf("静音", "关掉声音", "关闭声音", "没声音了"),
+        Rule(listOf("静音", "关掉声音", "关闭声音", "没声音了", "静音一下"),
             RemoteCommand.Act("volume.mute", "on"), "已静音"),
         // 内容类型。放在随机推荐之后：`随机推荐一部漫剧` 里也有「漫剧」，
         // 让更长的「随机推荐一部漫剧」先命中。
@@ -114,7 +135,7 @@ object VoiceIntent {
             RemoteCommand.Act("random.pick", "short"), "随机一部短剧"),
         Rule(listOf("随机推荐一部ai剧", "随机一部ai剧", "随机推荐一部ai"),
             RemoteCommand.Act("random.pick", "ai"), "随机一部 AI 剧"),
-        Rule(listOf("随机推荐", "随便来一部", "随机一部", "来点随机的", "随便看看", "推荐一部", "有什么好看的", "换一部看看"),
+        Rule(listOf("随机推荐", "随便来一部", "随机一部", "来点随机的", "随便看看", "推荐一部", "有什么好看的", "换一部看看", "来点别的", "看别的", "换一部", "随便放一部", "不知道看什么"),
             RemoteCommand.Act("random.pick"), "随机推荐"),
         Rule(listOf("切换漫剧", "换成漫剧", "看漫剧", "漫剧"),
             RemoteCommand.Act("type.set", "comic"), "漫剧"),
@@ -123,11 +144,11 @@ object VoiceIntent {
         Rule(listOf("切换ai剧", "换成ai剧", "看ai剧", "ai剧"),
             RemoteCommand.Act("type.set", "ai"), "AI 剧"),
         // 关于与工具
-        Rule(listOf("清理缓存", "清缓存", "释放空间", "缓存清理"),
+        Rule(listOf("清理缓存", "清缓存", "释放空间", "缓存清理", "清一下缓存"),
             RemoteCommand.Act("cache.clear"), "正在清理缓存"),
-        Rule(listOf("观看统计", "看了多少", "看剧时长", "统计一下"),
+        Rule(listOf("观看统计", "看了多少", "看剧时长", "统计一下", "看剧统计", "时长统计"),
             RemoteCommand.Act("stats.show"), "观看统计"),
-        Rule(listOf("备份记录", "导出记录", "备份"),
+        Rule(listOf("备份记录", "导出记录", "备份", "备份一下"),
             RemoteCommand.Act("backup.show"), "本机备份"),
         Rule(listOf("手机快传", "快传", "传文件", "传apk"),
             RemoteCommand.Act("quick.send"), "手机快传"),
@@ -137,6 +158,10 @@ object VoiceIntent {
             RemoteCommand.Act("transfer.refresh"), "二维码已刷新"),
         Rule(listOf("打开快传文件", "快传文件", "查看快传文件", "看看快传文件", "打开收到的文件", "收到的文件", "传过来的文件"),
             RemoteCommand.Act("transfer.files"), "快传文件"),
+        // 11-11 新增的全屏预览：图片进纯净预览、视频直接播、APK 弹安装确认，和列表里点一行一致。
+        // 「预览快传文件」比「快传文件」长，精确匹配取最长的别名，不会抢走打开列表的说法。
+        Rule(listOf("预览快传文件", "预览刚传的文件", "打开刚传的文件", "看看刚传的文件", "预览最新文件", "查看最新文件", "全屏预览"),
+            RemoteCommand.Act("transfer.preview"), "快传文件预览"),
         Rule(listOf("清空快传文件", "清空收到的文件", "清空传过来的文件", "删掉快传文件", "删除快传文件", "清空文件"),
             RemoteCommand.Act("transfer.clear"), "清空快传文件"),
         // 搜索历史主站与片源各存一份，一句话两边一起清——人不会记得自己在哪一栏搜过。
@@ -146,12 +171,21 @@ object VoiceIntent {
             RemoteCommand.Act("remote.address"), "遥控地址"),
         Rule(listOf("小爱同学设置", "小爱设置", "语音设置", "小爱连接"),
             RemoteCommand.Act("xiaoai.show"), "小爱同学"),
-        Rule(listOf("登录红果账户", "登录红果账号", "红果账号", "我的账号", "登录账号", "账号登录", "扫码登录", "登录"),
+        Rule(listOf("登录红果账户", "登录红果账号", "红果账号", "我的账号", "登录账号", "账号登录", "扫码登录", "登录", "红果登录", "账号信息"),
             RemoteCommand.Act("account.show"), "账号"),
         Rule(listOf("接口自检", "自检", "检查接口"),
             RemoteCommand.Act("check.interface"), "接口自检"),
         Rule(listOf("恢复隐藏", "恢复推荐", "取消隐藏"),
-            RemoteCommand.Act("hidden.restore"), "已恢复隐藏推荐")
+            RemoteCommand.Act("hidden.restore"), "已恢复隐藏推荐"),
+        // 网络代理。「代理」两个字太短——片名带「代理」的不少，词表里最短也要三个字。
+        Rule(listOf("打开网络代理", "开启网络代理", "打开代理", "开启代理", "开代理", "开个代理"),
+            RemoteCommand.Act("proxy.set", "on"), "网络代理已开启"),
+        Rule(listOf("关闭网络代理", "关掉网络代理", "关闭代理", "关掉代理", "关代理", "关了代理", "代理关掉"),
+            RemoteCommand.Act("proxy.set", "off"), "网络代理已关闭"),
+        Rule(listOf("网络代理状态", "代理状态", "看看代理", "代理开着吗", "代理服务器"),
+            RemoteCommand.Act("proxy.status"), "网络代理状态"),
+        Rule(listOf("网络代理", "代理开关", "切换代理", "换个代理"),
+            RemoteCommand.Act("proxy.set"), "已切换网络代理")
     ).sortedByDescending { rule -> rule.words.maxOf { it.length } }
 
     /**
@@ -161,12 +195,12 @@ object VoiceIntent {
     private val MODULES: List<ModuleRule> = listOf(
         ModuleRule(listOf("首页", "主页", "回首页", "回到首页"), "home", "首页"),
         ModuleRule(listOf("搜索页", "打开搜索", "去搜索"), "search", "搜索"),
-        ModuleRule(listOf("排行榜", "排行", "榜单", "热播榜", "榜"), "rank", "排行榜"),
-        ModuleRule(listOf("收藏夹", "我的收藏", "收藏页"), "favorite", "收藏"),
-        ModuleRule(listOf("历史记录", "观看历史", "最近观看", "观看记录", "历史"), "history", "最近观看"),
+        ModuleRule(listOf("排行榜", "排行", "榜单", "热播榜", "热榜", "榜"), "rank", "排行榜"),
+        ModuleRule(listOf("收藏夹", "我的收藏", "收藏页", "收藏列表"), "favorite", "收藏"),
+        ModuleRule(listOf("历史记录", "观看历史", "最近观看", "观看记录", "播放记录", "历史"), "history", "最近观看"),
         ModuleRule(listOf("设置页", "设置", "系统设置"), "settings", "设置"),
-        ModuleRule(listOf("三方源", "片源页", "片源"), "source", "片源"),
-        ModuleRule(listOf("本地库", "本地视频", "nas"), "library", "本地库")
+        ModuleRule(listOf("三方源", "三方片源", "片源页", "片源"), "source", "片源"),
+        ModuleRule(listOf("本地库", "本地视频", "本地片库", "nas"), "library", "本地库")
     ).sortedByDescending { rule -> rule.words.maxOf { it.length } }
 
     /** 列表词 → `list.play` 的列表键。 */
@@ -210,7 +244,10 @@ object VoiceIntent {
     )
 
     /** 定时停止的触发词。 */
-    private val SLEEP_WORDS = listOf("定时", "睡眠", "自动关机", "关电视", "关机", "看完这集", "看完这一集")
+    private val SLEEP_WORDS = listOf("定时", "睡眠", "自动关机", "关电视", "关机", "看完这集", "看完这一集", "定时关闭", "定时停止")
+
+    /** 取消定时的触发词：在时长判断**之前**检查，避免「取消定时」被吃成「定时 30 分钟」。 */
+    private val SLEEP_CANCEL = listOf("取消定时", "解除定时", "关闭定时", "关掉定时", "不定时", "取消关机", "取消关电视", "不用定时")
 
     /** 弱触发词：只有带上时长才当定时（`半小时后关掉`），单独出现多半是在说「关掉弹幕」。 */
     private val SLEEP_LOOSE = listOf("后关掉", "就关", "再关", "然后关")
@@ -362,8 +399,11 @@ object VoiceIntent {
         return Plan(RemoteCommand.Speed(nearest), "倍速 ${PlaybackSpeed.label(nearest)}")
     }
 
-    /** 定时停止：`半小时后关掉` → `sleep.set min:30`；`看完这集就关` → `sleep.set ep:1`。 */
+    /** 定时停止：`半小时后关掉` → `sleep.set min:30`；`看完这集就关` → `sleep.set ep:1`；`取消定时` → `sleep.set off`。 */
     private fun sleepOf(bare: String): Plan? {
+        if(SLEEP_CANCEL.any { bare.contains(it) }) {
+            return Plan(RemoteCommand.Act("sleep.set", "off"), "已取消定时停止")
+        }
         val explicit = SLEEP_WORDS.any { bare.contains(it) }
         val loose = SLEEP_LOOSE.any { bare.contains(it) }
         if(!explicit && !loose) return null

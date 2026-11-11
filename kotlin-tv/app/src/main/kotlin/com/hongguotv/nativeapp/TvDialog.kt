@@ -29,6 +29,8 @@ object TvDialog {
 
     /** 弹窗正文滚动区的标记：遥控上下键靠它找到该滚哪一块（见 [dispatchRemoteKey]）。 */
     private const val TAG_BODY = "tvdialog:body"
+    /** 确认框「确认」按钮的标记：语音「确认接收」直接点它，不去猜焦点落在哪个按钮上。 */
+    private const val TAG_CONFIRM = "tvdialog:confirm"
 
     /** 当前存活的弹窗，后进的在最上层。遥控要作用在它上面，见 [topmostDialog]。
      *  用 Dialog 而非 AlertDialog 登记：选集面板（EpisodePanel）和 NAS 播放器是独立 Dialog 窗口，同样要能被遥控。 */
@@ -52,6 +54,16 @@ object TvDialog {
     fun topmostDialog(): Dialog? {
         live.removeAll { !it.isShowing }
         return live.lastOrNull()
+    }
+
+    /**
+     * 语音 / 遥控的「确认接收」：点最上层确认框的「确认」按钮。
+     * 不看当前焦点，免得焦点停在「取消」时一句确认把接收给取消了；没有确认按钮就返回 false。
+     */
+    fun confirmTopmost(): Boolean {
+        val decor = topmostDialog()?.window?.decorView ?: return false
+        val ok = decor.findViewWithTag<View>(TAG_CONFIRM) ?: return false
+        return ok.isEnabled && ok.performClick()
     }
 
     /**
@@ -158,27 +170,35 @@ object TvDialog {
         }
     }
 
-    /** 胶囊按钮：默认 surface 底，焦点 accent 填充 + 深色文字。 */
-    fun capsuleButton(activity: Activity, text: String, onClick: () -> Unit): Button {
+    /**
+     * 胶囊按钮：默认 surface 底，焦点 accent 填充 + 深色文字。compact 用于按钮多的弹窗（单行放 6 个）。
+     * [radiusDp] 可单独调小：compact 只有 34dp 高，24dp 圆角会被裁成半高，短按钮看起来就是圆形；
+     * 快传弹窗把按钮拉宽后改用 10dp，做成圆角矩形而不是全胶囊。
+     */
+    fun capsuleButton(activity: Activity, text: String, compact: Boolean = false, radiusDp: Int = 24, onClick: () -> Unit): Button {
         val dp = { v: Int -> dp(activity, v) }
+        val corner = dp(radiusDp).toFloat()
         return Button(activity).apply {
             this.text = text
-            textSize = 15f
+            textSize = if(compact) 13f else 15f
             setTextColor(TvStyle.text)
-            minHeight = dp(44)
+            minHeight = dp(if(compact) 34 else 44)
+            // 主题默认 minWidth≈88dp 会把「帮助/停用/取消」这类短字按钮撑大，
+            // 六按钮单行直接溢出——compact 下清零，宽度交给内容
+            if(compact) { minWidth = 0; minimumWidth = 0 }
             // 弹窗在触摸模式（IR 鼠标棒点击过屏幕）里创建时，requestFocus 只对
             // focusableInTouchMode 的 view 生效——不然 showExitConfirm 的默认焦点挂不上
             isFocusableInTouchMode = true
-            setPadding(dp(20), 0, dp(20), 0)
+            setPadding(dp(if(compact) 12 else 20), 0, dp(if(compact) 12 else 20), 0)
             background = GradientDrawable().apply {
                 setColor(TvStyle.surface)
-                cornerRadius = dp(24).toFloat()
+                cornerRadius = corner
                 setStroke(dp(1), TvStyle.outline)
             }
             setOnFocusChangeListener { _, focused ->
                 background = GradientDrawable().apply {
                     setColor(if(focused) TvStyle.accent else TvStyle.surface)
-                    cornerRadius = dp(24).toFloat()
+                    cornerRadius = corner
                     setStroke(dp(1), if(focused) TvStyle.accent else TvStyle.outline)
                 }
                 setTextColor(if(focused) TvStyle.background else TvStyle.text)
@@ -393,7 +413,7 @@ object TvDialog {
             setPadding(0, dp(activity, 14), 0, 0)
         }
         val cancel = capsuleButton(activity, "取消") {}
-        val ok = capsuleButton(activity, "确认") { action() }
+        val ok = capsuleButton(activity, "确认") { action() }.apply { tag = TAG_CONFIRM }
         buttons.addView(cancel, LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(activity, 12) })
         buttons.addView(ok, LinearLayout.LayoutParams(-2, -2))
         content.addView(buttons)

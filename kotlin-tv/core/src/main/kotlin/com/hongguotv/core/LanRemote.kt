@@ -174,8 +174,12 @@ val REMOTE_ACTIONS = setOf(
     "theme.toggle",     // 切换深/浅主题
     "theme.set",        // 指定主题：arg = dark | light
     "clock.toggle",     // 顶栏系统时间
+    "netspeed.toggle",  // 右上角实时网速悬浮条（切换）
+    "netspeed.set",     // 显式开 / 关网速：arg = on | off
     "backdrop.reset",   // 恢复默认背景
+    "backdrop.set",     // 最近一张快传图片设为电视背景
     "dialog.close",     // 关掉当前最上层的弹窗（没有弹窗时不执行）
+    "dialog.confirm",   // 点最上层确认框的「确认」（接收上传 / 安装 / 设背景）
     // 播放偏好（设置页里的开关）
     "autonext.toggle",  // 自动连播
     "autoseason.toggle",// 系列剧连播
@@ -188,16 +192,18 @@ val REMOTE_ACTIONS = setOf(
     "play.replay",      // 从头播放本集
     "player.close",     // 退出播放器，回到详情页
     "panel.episodes",   // 呼出选集面板（电视播放页 / 片源播放页）
+    "panel.quick",      // 呼出播放快捷面板（清晰度/倍速/弹幕/更多，仅播放页）
     "skip.intro",       // 按本剧片头标记跳过片头
     "speed.up",         // 倍速 +1 档（播放页只作用于本剧）
     "speed.down",       // 倍速 -1 档
-    "sleep.set",        // 定时停止：arg = min:<分钟> | ep:<集数>
+    "sleep.set",        // 定时停止：arg = min:<分钟> | ep:<集数> | off（取消）
     // 列表定位：arg = "<列表>:<序号>"，序号从 1 开始，见 [REMOTE_LIST_KINDS]
     "list.play",
     // 继续观看
     "resume.latest",    // 接着看最近一条
     // 详情页
     "favorite.toggle",  // 收藏 / 取消收藏当前剧
+    "favorite.check",   // 手动检查收藏的剧有没有更新
     // 浏览
     "type.set",         // 切内容类型：arg = comic | short | ai
     "random.pick",      // 随机推荐一部并打开详情：arg = comic | short | ai（空=当前类型）
@@ -215,11 +221,15 @@ val REMOTE_ACTIONS = setOf(
     "transfer.refresh", // 刷新手机快传的二维码
     "transfer.files",   // 打开快传文件列表
     "transfer.clear",   // 清空快传收到的全部文件
+    "transfer.preview", // 全屏预览 / 播放最近一个快传文件
     "history.clear",    // 清空搜索历史（主站 + 片源）
     "remote.address",   // 遥控地址
     "xiaoai.show",      // 小爱同学设置
     "account.show",     // 账号
-    "hidden.restore"    // 恢复隐藏推荐
+    "hidden.restore",   // 恢复隐藏推荐
+    // 网络代理（DNS 污染/SNI 阻断场景的开关）
+    "proxy.set",        // 开关代理：arg = on | off（空=切换；开启要求配置完整）
+    "proxy.status"      // 播报当前代理状态
 )
 
 /** `list.play` 的列表键：`history` 最近观看、`favorite` 收藏、`catalog` 当前列表、`episodes` 选集。 */
@@ -346,7 +356,11 @@ object RemoteProtocol {
                     id == "type.set" && arg !in REMOTE_TYPE_KEYS -> null
                     id == "random.pick" && arg.isNotEmpty() && arg !in REMOTE_TYPE_KEYS -> null
                     id == "volume.mute" && arg !in setOf("", "on", "off") -> null
-                    id == "sleep.set" && sleepTarget(arg) == null -> null
+                    id == "proxy.set" && arg !in setOf("", "on", "off") -> null
+                    id == "netspeed.set" && arg !in setOf("on", "off") -> null
+                    // 无参数动作：界面层只该收到空 arg，带尾巴的一律在入口拒掉
+                    id in setOf("backdrop.set", "dialog.confirm", "transfer.preview") && arg.isNotEmpty() -> null
+                    id == "sleep.set" && sleepTarget(arg) == null && arg != "off" -> null
                     else -> RemoteCommand.Act(id, arg)
                 }
             }

@@ -266,8 +266,11 @@ class ThirdStore(context: Context) {
         }
     }
 
-    /** 备份/导出用：只保留名称与接口。 */
-    fun backupSources(): List<BackupThirdSource> = sources().map { BackupThirdSource(it.name, it.api) }
+    /** 备份/导出用：源类型、专用请求头与元数据随配置一起迁移。 */
+    fun backupSources(): List<BackupThirdSource> = sources().map {
+        BackupThirdSource(it.name, it.api, it.type, it.headers,
+            it.searchable, it.quickSearch, it.filterable, it.categories, it.timeoutSeconds)
+    }
 
     /** 恢复源配置：本地已有的接口一律保留（不覆盖），只追加缺失项；返回新增数量。 */
     fun mergeRestored(incoming: List<BackupThirdSource>): Int {
@@ -277,8 +280,11 @@ class ThirdStore(context: Context) {
         val added = incoming.asSequence()
             .filter { it.api.startsWith("http") && known.add(it.api) }
             .take(room)
-            .map { ThirdSource("u" + it.api.hashCode().toUInt().toString(),
-                it.name.ifBlank { it.api.removePrefix("https://").removePrefix("http://").substringBefore('/') }, it.api) }
+            .map {
+                ThirdSource("u" + it.api.hashCode().toUInt().toString(),
+                    it.name.ifBlank { it.api.removePrefix("https://").removePrefix("http://").substringBefore('/') }, it.api,
+                    it.headers, it.type, it.searchable, it.quickSearch, it.filterable, it.categories, it.timeoutSeconds)
+            }
             .toList()
         if(added.isEmpty()) return 0
         saveSources(local + added)
@@ -296,16 +302,41 @@ class ThirdStore(context: Context) {
             val item = array.optJSONObject(index) ?: return@mapNotNull null
             val id = item.optString("id"); val api = item.optString("api")
             if(id.isEmpty() || api.isEmpty()) null
-            else ThirdSource(id, item.optString("name"), api)
+            else ThirdSource(id, item.optString("name"), api, readHeaders(item),
+                item.optInt("type", 1),
+                item.optBoolean("searchable", true), item.optBoolean("quickSearch", true),
+                item.optBoolean("filterable", true), readCategories(item), item.optInt("timeoutSeconds", 0))
         }
     }
 
     private fun writeSources(list: List<ThirdSource>): String {
         val array = JSONArray()
         list.forEach { source ->
-            array.put(JSONObject().put("id", source.id).put("name", source.name).put("api", source.api))
+            val item = JSONObject().put("id", source.id).put("name", source.name).put("api", source.api)
+            if(source.headers.isNotEmpty()) item.put("headers", JSONObject(source.headers))
+            if(source.type != 1) item.put("type", source.type)
+            if(!source.searchable) item.put("searchable", false)
+            if(!source.quickSearch) item.put("quickSearch", false)
+            if(!source.filterable) item.put("filterable", false)
+            if(source.categories.isNotEmpty()) item.put("categories", JSONArray(source.categories))
+            if(source.timeoutSeconds > 0) item.put("timeoutSeconds", source.timeoutSeconds)
+            array.put(item)
         }
         return array.toString()
+    }
+
+    /** 旧格式（无 headers 键）与损坏内容都安全回落为空表。 */
+    private fun readHeaders(item: JSONObject): Map<String, String> {
+        val obj = item.optJSONObject("headers") ?: return emptyMap()
+        return obj.keys().asSequence().mapNotNull { key ->
+            val value = obj.optString(key).trim()
+            if(key.isNotBlank() && value.isNotEmpty()) key.trim() to value else null
+        }.toMap()
+    }
+
+    private fun readCategories(item: JSONObject): List<String> {
+        val array = item.optJSONArray("categories") ?: return emptyList()
+        return (0 until array.length()).mapNotNull { index -> array.optString(index).ifEmpty { null } }
     }
 
     companion object {

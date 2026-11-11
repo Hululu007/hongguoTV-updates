@@ -68,6 +68,9 @@ class VoiceIntentTest {
         assertEquals("autoskip.toggle" to "", act("自动跳过"))
         assertEquals("danmaku.toggle" to "", act("关掉弹幕"))
         assertEquals("clock.toggle" to "", act("显示时间"))
+        // 网速改成显式开 / 关：说「显示网速」时本来开着不该被切成关
+        assertEquals("netspeed.set" to "on", act("显示网速"))
+        assertEquals("netspeed.set" to "off", act("关闭网速"))
     }
 
     @Test
@@ -263,6 +266,85 @@ class VoiceIntentTest {
         assertEquals(RemoteCommand.Open("history"), command("打开历史记录"))
     }
 
+    // ------------------------------------------------------------ 网络代理
+
+    /**
+     * 代理的三种说法各归各的：开、关、查状态。
+     *
+     * 「代理」两个字太短——片名带「代理」的不少，所以词表里最短也要三个字。
+     * 「关闭代理服务器」这类混合句同时命中「关闭代理」和「代理服务器」时，
+     * 宁可落到只读的 status 也不要落成方向相反的开关。
+     */
+    @Test
+    fun proxyVariants() {
+        listOf("打开网络代理", "开启代理", "开代理", "开个代理").forEach {
+            assertEquals("「$it」应开代理", "proxy.set" to "on", act(it))
+        }
+        listOf("关闭网络代理", "关掉代理", "关代理", "关了代理").forEach {
+            assertEquals("「$it」应关代理", "proxy.set" to "off", act(it))
+        }
+        listOf("代理状态", "网络代理状态", "代理服务器", "代理开着吗").forEach {
+            assertEquals("「$it」应查代理状态", "proxy.status" to "", act(it))
+        }
+        // 切换语义：不带方向的「网络代理」「代理开关」
+        listOf("网络代理", "代理开关", "切换代理").forEach {
+            assertEquals("「$it」应切代理", "proxy.set" to "", act(it))
+        }
+        // 混合长句不落成开关
+        assertEquals("proxy.status", act("关闭代理服务器")?.first)
+    }
+
+    @Test
+    fun proxyArgsSurviveProtocol() {
+        listOf("on", "off", "").forEach { arg ->
+            val body = """{"cmd":"act","id":"proxy.set","arg":"$arg"}"""
+            assertEquals(RemoteCommand.Act("proxy.set", arg), RemoteProtocol.parse(body))
+        }
+        // 非法 arg 在协议入口就被拒掉
+        assertNull(RemoteProtocol.parse("""{"cmd":"act","id":"proxy.set","arg":"maybe"}"""))
+        assertEquals(RemoteCommand.Act("proxy.status"), RemoteProtocol.parse("""{"cmd":"act","id":"proxy.status"}"""))
+    }
+
+    // ------------------------------------------------------------ 指令扩充
+
+    /** 取消定时必须在时长判断之前生效，否则「取消定时」会被吃成「定时 30 分钟」。 */
+    @Test
+    fun sleepCancelVariants() {
+        listOf("取消定时", "解除定时", "关闭定时", "不定时了", "取消关机").forEach {
+            assertEquals("「$it」应取消定时", "sleep.set" to "off", act(it))
+        }
+        // 设置了再取消，整条链路语义正确
+        assertEquals("sleep.set" to "min:30", act("定时30分钟"))
+        assertEquals("sleep.set" to "off", act("取消定时"))
+    }
+
+    @Test
+    fun quickPanelAndFavoriteCheck() {
+        listOf("播放设置", "快捷面板", "播放面板", "播放快捷面板").forEach {
+            assertEquals("「$it」应呼出播放快捷面板", "panel.quick", act(it)?.first)
+        }
+        listOf("检查收藏更新", "看看收藏有没有更新", "收藏有没有更新", "检查收藏").forEach {
+            assertEquals("「$it」应检查收藏更新", "favorite.check", act(it)?.first)
+        }
+        // 「播放设置」不能吃掉「播放记录」这种导航说法
+        assertEquals(RemoteCommand.Open("history"), command("播放记录"))
+    }
+
+    @Test
+    fun enrichedAliases() {
+        assertEquals("play.next" to "", act("下一话"))
+        assertEquals("play.prev" to "", act("上一话"))
+        assertEquals("play.replay" to "", act("再放一遍"))
+        assertEquals("player.close" to "", act("不看了"))
+        assertEquals("resume.latest" to "", act("上次那个"))
+        assertEquals("random.pick" to "", act("来点别的"))
+        assertEquals("update.check" to "", act("版本升级"))
+        assertEquals("volume.mute" to "on", act("静音一下"))
+        assertEquals(RemoteCommand.Open("rank"), command("打开热榜"))
+        assertEquals(RemoteCommand.Open("favorite"), command("收藏列表"))
+        assertEquals(RemoteCommand.Open("library"), command("本地片库"))
+    }
+
     // ------------------------------------------------------------ 一致性
 
     /**
@@ -284,13 +366,49 @@ class VoiceIntentTest {
             "半小时后关掉", "看完这集就关", "声音大一点", "声音小一点", "静音", "取消静音",
             "随机推荐一部漫剧", "随机推荐", "切换短剧", "看漫剧",
             // 新增：快传三件事与搜索历史
-            "刷新二维码", "打开快传文件", "清空文件", "清空搜索历史"
+            "刷新二维码", "打开快传文件", "清空文件", "清空搜索历史",
+            // 新增：网络代理
+            "打开代理", "关代理", "代理状态", "网络代理"
         )
         for(text in samples) {
             val cmd = VoiceIntent.parse(text)?.command
             if(cmd is RemoteCommand.Act) {
                 assertTrue("「$text」产出的 ${cmd.id} 不在白名单里", cmd.id in REMOTE_ACTIONS)
             }
+        }
+    }
+
+    // ------------------------------------------------------------ 11-11 新增动作
+
+    /** 新功能补的四个动作 + 网速显式开关：长词优先，旧说法不能被新规则抢走。 */
+    @Test
+    fun quickTransferAndDialogActsAreUnambiguous() {
+        assertEquals("netspeed.set" to "on", act("显示网速"))
+        assertEquals("netspeed.set" to "on", act("打开网速显示"))
+        assertEquals("netspeed.set" to "off", act("隐藏网速"))
+        assertEquals("netspeed.set" to "off", act("关闭网速显示"))
+        assertEquals("netspeed.set" to "off", act("关掉网速"))
+        assertEquals("netspeed.toggle" to "", act("切换网速"))
+        assertEquals("netspeed.toggle" to "", act("网速显示"))
+        assertEquals("transfer.preview" to "", act("预览快传文件"))
+        assertEquals("transfer.preview" to "", act("全屏预览"))
+        assertEquals("backdrop.set" to "", act("设为电视背景"))
+        assertEquals("backdrop.set" to "", act("把快传图片设为背景"))
+        assertEquals("dialog.confirm" to "", act("确认接收"))
+        assertEquals("dialog.confirm" to "", act("点确认"))
+        // 旧说法原地不动
+        assertEquals("transfer.files" to "", act("打开快传文件"))
+        assertEquals("transfer.files" to "", act("快传文件"))
+        assertEquals("backdrop.reset" to "", act("恢复默认背景"))
+        assertEquals("dialog.close" to "", act("关闭弹窗"))
+        assertEquals("quick.send" to "", act("手机快传"))
+    }
+
+    /** 两个字的光杆词不能当指令：那是剧名的地盘，别名一律最短三个字。 */
+    @Test
+    fun shortBareWordsAreNotCommands() {
+        for(word in listOf("确认", "网速", "预览", "背景")) {
+            assertNull("「$word」不该产出动作键", act(word))
         }
     }
 

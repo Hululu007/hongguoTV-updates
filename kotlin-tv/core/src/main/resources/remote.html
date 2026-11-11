@@ -190,6 +190,14 @@
   .banner{background:#3A2E14;color:var(--warn);font-size:12.5px;line-height:1.5;
     padding:10px 18px;display:none;align-items:center;gap:8px;flex:0 0 auto}
   .banner.on{display:flex}
+  /* 上传文件到电视：底部轻提示，不挡方向键与播放控制 */
+  .uptoast{position:fixed;left:50%;bottom:16px;z-index:60;max-width:min(92vw,460px);
+    background:rgba(18,22,30,.95);border:1px solid var(--outline);color:var(--text);
+    font-size:12.5px;line-height:1.45;padding:9px 14px;border-radius:999px;
+    opacity:0;transform:translateX(-50%) translateY(8px);pointer-events:none;
+    transition:opacity .18s ease,transform .18s ease;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .uptoast.on{opacity:1;transform:translateX(-50%) translateY(0)}
   /* 置灰但仍可辨认：完全看不清等于「坏了」，用户需要知道原来在播什么 */
   .frozen .now,.frozen .prog,.frozen .ctrl,.frozen .params,.frozen .searchwrap,.frozen .quick,.frozen .openlist{
     opacity:.45;filter:saturate(.5);pointer-events:none}
@@ -292,6 +300,24 @@
     #v-panel .quick{padding-top:8px}
     #v-panel .openlist{margin-top:10px}
   }
+  /* 指令集帮助抽屉：分组卡片按内容高度排，竖屏一列往下滚 */
+  .csub{margin-left:10px;font-size:11px;color:var(--dim);flex:1 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .cbody{overflow-y:auto;min-height:0;flex:1 1 auto;overscroll-behavior:contain;
+    -webkit-overflow-scrolling:touch;padding:2px 16px 22px;column-count:1;column-gap:14px}
+  .cg{break-inside:avoid;-webkit-column-break-inside:avoid;display:inline-block;width:100%;
+    margin:0 0 12px;border:1px solid var(--outline);border-radius:12px;
+    background:var(--surface);padding:10px 12px 6px;box-sizing:border-box}
+  .cg h3{margin:0 0 4px;font-size:12.5px;color:var(--accent);font-weight:650}
+  .crow{display:flex;flex-wrap:wrap;align-items:baseline;gap:3px 6px;padding:3px 0;font-size:12px;line-height:1.6}
+  .crow b{background:var(--accent-bg);color:var(--accent);border-radius:6px;
+    padding:1px 7px;font-weight:600;font-size:11.5px;white-space:nowrap}
+  .crow span{color:var(--muted);flex:1 1 120px;min-width:0}
+
+  /* 横屏：竖向空间金贵，两栏并排 + 更宽的板，一眼多看几组、少滚一半 */
+  @media (orientation:landscape){
+    #cdsheet{max-width:920px}
+    .cbody{column-count:2;padding:2px 18px 18px}
+  }
 </style>
 </head>
 <body>
@@ -305,11 +331,16 @@
   <!-- 菜单放进 bar：宽屏把内容收窄居中后，绝对定位仍跟着「···」走 -->
   <div class="menu" id="menu">
     <button id="m-exit">返回上一级（退回详情或收起菜单）</button>
+    <button id="m-cmds">指令集（能听懂的说法）</button>
+    <button id="m-upload">上传文件到电视（可多选）</button>
     <button id="m-detach">断开遥控</button>
     <div class="addr" id="m-addr"></div>
   </div>
 </div>
 <div class="banner" id="banner">电视已暂停。请在电视上重新打开红果TV，回来后会接着遥控。</div>
+<!-- 三点菜单里的「上传文件到电视」：可多选，整批一次请求、电视只弹一次确认 -->
+<input type="file" id="up-file" multiple hidden>
+<div class="uptoast" id="uptoast"></div>
 
 <!-- 形态切换：两个形态都要能点到，否则播放中就无法切到浏览、也就没有方向键可用 -->
 <div class="modebar">
@@ -400,6 +431,14 @@
     <header><h2>选集</h2><button class="x" id="drawer-x">✕</button></header>
     <div class="groups" id="groups"></div>
     <div class="grid" id="grid"></div>
+  </div>
+</div>
+
+<!-- 指令集帮助：与代码词表同步维护，竖屏单列、横屏两栏 -->
+<div class="drawer" id="cdrawer">
+  <div class="sheet" id="cdsheet">
+    <header><h2>指令集</h2><span class="csub">对遥控输入框说这些说法</span><button class="x" id="cds-x">✕</button></header>
+    <div class="cbody" id="cbody"></div>
   </div>
 </div>
 
@@ -875,6 +914,200 @@
   };
   $("drawer-x").onclick = closeDrawer;
   $("drawer").addEventListener("click", function(e){ if(e.target === $("drawer")) closeDrawer(); });
+
+  // ---- 指令集帮助：内容与 VoiceIntent 词表同步维护 ----
+  var CMD_GROUPS = [
+    { name: "找剧与继续看", rows: [
+      ["剧名 / 我要看·剧名", "摆出搜索结果，点一下就播"],
+      ["剧名 + 第几集", "「文盲修仙第七集」直接播那一集"],
+      ["接着看 / 上次看到哪", "继续上次观看"],
+    ]},
+    { name: "播放控制", rows: [
+      ["暂停 / 继续播放", "暂停或继续"],
+      ["上一集 / 下一集", "切集"],
+      ["从头播放", "重新播这一集"],
+      ["选集", "打开选集面板"],
+      ["跳过片头", "一键跳过"],
+      ["快进30秒 / 后退一分钟", "带时长即可，「跳到5分钟」也行"],
+      ["1.5倍速 / 两倍速", "「快一点」「慢一点」按档位调"],
+      ["播放设置 / 快捷面板", "呼出快捷面板：清晰度/倍速/弹幕/更多"],
+      ["退出播放", "回到详情页，「不看了」也行"],
+    ]},
+    { name: "列表与序号", rows: [
+      ["历史记录第二个", "「收藏第3个」同理"],
+      ["第五个", "当前列表或选集的第 5 个"],
+    ]},
+    { name: "声音", rows: [
+      ["声音大一点 / 小一点", "系统媒体音量"],
+      ["静音 / 取消静音", "一键切换"],
+    ]},
+    { name: "定时关闭", rows: [
+      ["半小时后关掉", "「定时20分钟」同理"],
+      ["看完这集就关", "播完当前集自动停"],
+      ["取消定时", "解除已设的定时停止"],
+    ]},
+    { name: "画面与主题", rows: [
+      ["深色主题 / 浅色主题", "两套配色来回换"],
+      ["切换主题", "按当前状态切"],
+      ["显示时间", "顶栏时钟开关"],
+      ["打开网速 / 关闭网速", "显式开 / 关实时上下行，重复说也不会反过来切"],
+      ["切换网速", "在开 / 关之间切换"],
+      ["恢复默认背景", "背景图恢复默认"],
+      ["设为电视背景", "把最近一张快传图片用作背景"],
+      ["关闭弹窗", "关掉电视上的弹窗（不是弹幕）"],
+      ["确认接收", "确认接收 / 安装 / 设背景等确认框"],
+    ]},
+    { name: "播放偏好", rows: [
+      ["自动连播 / 系列剧连播", "连播与跨季开关"],
+      ["弹幕", "「打开弹幕」「关闭弹幕」都行"],
+      ["自动跳过", "跳过不兼容的片源"],
+    ]},
+    { name: "随机推荐", rows: [
+      ["随机推荐一部短剧", "「漫剧」「AI剧」同理"],
+      ["随机推荐", "任意一部"],
+      ["看短剧 / 看漫剧 / 看AI剧", "切换内容类型"],
+    ]},
+    { name: "导航与返回", rows: [
+      ["回首页 / 打开搜索页", "「排行榜」「收藏夹」「历史记录」「设置」「片源」「本地库」同理"],
+      ["返回上一级", "等同遥控器返回键"],
+    ]},
+    { name: "收藏与账号", rows: [
+      ["收藏这个 / 取消收藏", "收藏当前剧集"],
+      ["检查收藏更新", "看看收藏的剧有没有新集"],
+      ["登录红果账户", "打开登录页（扫码 / 手机号验证码）"],
+      ["观看统计", "看了多少、看了多久"],
+    ]},
+    { name: "更新与维护", rows: [
+      ["检查更新", "查新版本"],
+      ["清理缓存", "释放空间"],
+      ["备份记录", "本机备份入口"],
+      ["接口自检", "片源接口连通性检查"],
+      ["恢复隐藏推荐", "取消隐藏的推荐位"],
+    ]},
+    { name: "快传与遥控", rows: [
+      ["手机快传", "打开传文件"],
+      ["刷新二维码", "快传码换一张"],
+      ["打开快传文件", "查看收到的文件"],
+      ["预览快传文件 / 全屏预览", "看最近收到的图片或视频"],
+      ["上传文件到电视", "手机页面右上角「···」操作，可多选；电视上点「确认接收」"],
+      ["清空快传文件 / 清空搜索历史", "两处各清各的"],
+      ["遥控地址", "显示遥控接口地址"],
+    ]},
+    { name: "网络代理", rows: [
+      ["打开网络代理 / 关闭网络代理", "按已保存的配置开关"],
+      ["网络代理", "在开 / 关之间切换"],
+      ["代理状态", "播报当前开关与地址"],
+    ]},
+  ];
+  (function buildCmds(){
+    var body = $("cbody");
+    CMD_GROUPS.forEach(function(g){
+      var card = document.createElement("div");
+      card.className = "cg";
+      var h = document.createElement("h3");
+      h.textContent = g.name;
+      card.appendChild(h);
+      g.rows.forEach(function(r){
+        var row = document.createElement("div");
+        row.className = "crow";
+        var b = document.createElement("b");
+        b.textContent = r[0];
+        var s = document.createElement("span");
+        s.textContent = r[1];
+        row.appendChild(b); row.appendChild(s);
+        card.appendChild(row);
+      });
+      body.appendChild(card);
+    });
+  })();
+  $("m-cmds").onclick = function(){
+    $("menu").classList.remove("on");
+    $("cdrawer").classList.add("on");
+  };
+
+  // ------------------------------------------------------------ 上传文件到电视
+  // 一次选多个文件只发一条 /upload-batch：电视整批只弹一次确认，确认后一起接收。
+  // 请求体 = 8 位十进制清单长度 + ASCII 清单(c/n0/s0/n1/s1…) + 各文件原始字节。
+  // 清单不含文件内容，所以点「取消」时整批一个字节都不落地。
+  (function(){
+    var input = $("up-file"), toast = $("uptoast");
+    if(!input || !toast) return;
+    var hideTimer = 0, stallTimer = 0, lastLoaded = -1, lastAt = 0, waiting = false, done = false;
+    function human(n){
+      if(n < 1024) return n + " B";
+      if(n < 1048576) return Math.round(n / 1024) + " KB";
+      if(n < 1073741824) return (n / 1048576).toFixed(1) + " MB";
+      return (n / 1073741824).toFixed(1) + " GB";
+    }
+    /** 清单经 encodeURIComponent 后全是 ASCII，直接按字节装入 Uint8Array。 */
+    function ascii(s){
+      var a = new Uint8Array(s.length);
+      for(var i = 0; i < s.length; i++) a[i] = s.charCodeAt(i) & 255;
+      return a;
+    }
+    function pad8(n){ var s = String(n); while(s.length < 8) s = "0" + s; return s; }
+    /** hold=true：进度类提示，不自动消失；上传结束用下一句覆盖。 */
+    function note(text, hold){
+      toast.textContent = text;
+      toast.classList.add("on");
+      clearTimeout(hideTimer);
+      if(!hold) hideTimer = setTimeout(function(){ toast.classList.remove("on"); }, 3200);
+    }
+    function stopStall(){ clearInterval(stallTimer); stallTimer = 0; }
+    $("m-upload").onclick = function(){
+      $("menu").classList.remove("on");
+      input.value = "";
+      input.click();
+    };
+    input.onchange = function(){
+      var files = Array.prototype.slice.call(input.files || []);
+      if(!files.length) return;
+      var total = 0;
+      for(var i = 0; i < files.length; i++) total += files[i].size;
+      if(files.length > 20){ note("一次最多选 20 个文件，请分批上传", false); return; }
+      if(total > 2147483648){ note("一次最多上传 2 GB，请分批上传", false); return; }
+      var meta = "c=" + files.length;
+      for(var i = 0; i < files.length; i++)
+        meta += "&n" + i + "=" + encodeURIComponent(files[i].name) + "&s" + i + "=" + files[i].size;
+      var metaBytes = ascii(meta);
+      var blob = new Blob([ascii(pad8(metaBytes.length)), metaBytes].concat(files));
+      var xhr = new XMLHttpRequest();
+      lastLoaded = -1; lastAt = Date.now(); waiting = false; done = false;
+      stopStall();
+      stallTimer = setInterval(function(){
+        if(done || waiting || lastLoaded < 0) return;
+        if(Date.now() - lastAt > 2000){
+          waiting = true;
+          note("等待确认 · 请在电视上点「确认」，一起接收 " + files.length + " 个文件", true);
+        }
+      }, 800);
+      xhr.open("POST", "/" + token + "/upload-batch");
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.upload.onprogress = function(e){
+        if(!e.lengthComputable) return;
+        if(e.loaded !== lastLoaded){ lastLoaded = e.loaded; lastAt = Date.now(); waiting = false; }
+        note("正在发送 " + files.length + " 个文件 · " + human(total) + " · "
+          + Math.round(e.loaded * 100 / e.total) + "%", true);
+      };
+      xhr.onload = function(){
+        done = true; stopStall();
+        note(xhr.status === 200
+          ? ("已接收 · " + (xhr.responseText || (files.length + " 个文件")))
+          : ("未接收 · " + (xhr.responseText || "电视未响应")), false);
+        input.value = "";
+      };
+      xhr.onerror = function(){
+        done = true; stopStall();
+        note("连接已断开，请重新扫码连接电视", false);
+        input.value = "";
+      };
+      note("正在发送 " + files.length + " 个文件 · " + human(total), true);
+      xhr.send(blob);
+    };
+  })();
+  function closeCmds(){ $("cdrawer").classList.remove("on"); }
+  $("cds-x").onclick = closeCmds;
+  $("cdrawer").addEventListener("click", function(e){ if(e.target === $("cdrawer")) closeCmds(); });
 
   function loadEpisodes(){
     if(lastEpisodes){ paintDrawer(); return; }

@@ -65,6 +65,9 @@ class MainActivity: Activity() {
     /** 界面整体缩放：包一层调过密度的 Context，dp/sp 等比生效（见 UiScale 注释）。 */
     override fun attachBaseContext(base: android.content.Context) {
         super.attachBaseContext(UiScale.wrap(base))
+        // 必须早于任何 OkHttpClient / HttpURLConnection 构建装上全局 ProxySelector，
+        // 否则客户端捕获的是旧 selector，运行中切换代理对已存在的客户端不生效
+        AppProxy.install(base)
     }
     private val bg by lazy { TvStyle.background }; private val surface by lazy { TvStyle.surface }
     private val accent by lazy { TvStyle.accent }; private val white by lazy { TvStyle.text }; private val muted by lazy { TvStyle.muted }
@@ -136,6 +139,11 @@ class MainActivity: Activity() {
     private var libraryLoadError: Throwable?=null
     private var localPermissionContinuation: (() -> Unit)?=null
     private var clockView: TextView?=null
+    /** 右上角实时网速悬浮条（设置/语音开关，默认关闭）：随每次 root 重建重新挂载，所有界面常显。 */
+    private var netSpeedView: TextView?=null
+    private var netSpeedTick: Runnable?=null
+    private var lastRxBytes=-1L
+    private var lastTxBytes=-1L
     private var clockTick: Runnable?=null
     private var workScope: RequestScope?=null
     private var workJob: java.util.concurrent.Future<*>?=null
@@ -153,10 +161,16 @@ class MainActivity: Activity() {
     private var catalogFocusPos=RecyclerView.NO_POSITION
     /** 焦点当前是否在网格卡片内：用于在 Activity 层拦截下键，即使焦点被回收清空也按记住的位置继续下移 */
     private var gridFocusOwned=false
+    /** 跨区/跨行移动的目标位置：焦点卡被滚动回收时，恢复逻辑优先聚焦它而不是抢回原卡。 */
+    private var pendingGridFocusPos=RecyclerView.NO_POSITION
     private var loadingMore=false
     private var homePosition: HomeScreen.Position?=null
     private var catalogPageKey=""
     private val scrollPositions=mutableMapOf<String,Int>()
+    /** 与 scrollPositions 配对的像素偏移（首个可见卡片 top 相对 RecyclerView 顶）：原位恢复视口用。 */
+    private val scrollOffsets=mutableMapOf<String,Int>()
+    /** 上次触发列表重建时的云端数据签名（登录态+云端记录数+云端收藏数）：状态文本变化不再重建页面。 */
+    private var lastCloudSig=0
     private var prefetchAttemptAt=0L
     private var prefetchAttempts=0
     private var homeScreen: HomeScreen?=null
@@ -341,6 +355,8 @@ class MainActivity: Activity() {
     private val nav=mutableListOf<View>()
     // 二级分段首项：导航 ↓ 先落到分段，再进内容
     private var segmentFirst: View?=null
+    // 我的模块（最近观看/收藏）各分段按钮：切进我的时焦点先落当前页对应的分段，方便上下切区
+    private var segmentChipsByTab: Map<Int,View> =emptyMap()
     private val typeButtons=mutableMapOf<ContentType,View>()
     private var searchInput: View?=null
     private var searchButton: View?=null
@@ -370,6 +386,8 @@ class MainActivity: Activity() {
     private var historyManage: View?=null
     private var historySync: View?=null
     private var historyRefresh: View?=null
+    private var favoriteCloudSync: View?=null
+    private var favoriteCloudRefresh: View?=null
     /** 云端记录卡片点击后的续播进度：只用于起播，落地仍由播放中的 saveProgress 写本机。 */
     private var pendingCloudResume: CloudProgress?=null
     /** 设置页重建后要恢复焦点的设置项标签前缀。 */
@@ -538,10 +556,18 @@ class MainActivity: Activity() {
         accountManager=AccountManager(this,library)
         accountManager.onAccountChanged={
             accountButton?.text=accountManager.accountLabel
-            // 账号状态变化后，正在展示的记录页立即重建（登录后拉取云端历史、退出后清空云端区）。
-            // isLoaded 必须查：recreate()（换主题/缩放）会新建 AccountManager 并可能立刻回调，
-            // 此时本机记录还在异步加载，showCatalog 里 navHiddenAt 一碰 state() 就崩。
-            if(library.isLoaded && screen=="catalog" && (tab==4 || collection=="resume")) showCatalog()
+            // 账号事件只在云端数据实际变化时才重建列表页：读取过程的每条状态文本
+            // （正在读取/已读取 N 部/读取失败）都会触发 changed()，若全部重建，
+            // 用户在最近观看/收藏页往下滚的几秒内会被整页弹回顶部 2~3 次（issue #19.2）。
+            // 签名=登录态+云端记录数+云端收藏数+上新计数；数据到达/清空/上新角标变化时才变化。
+            val sig=if(accountManager.signedIn) 1+accountManager.cloudRows().size+accountManager.cloudFavoriteRows().size*1000+(library.updatedCloudFavorites()+library.cloudNewCount())*1000000 else 0
+            if(sig!=lastCloudSig) {
+                lastCloudSig=sig
+                // isLoaded 必须查：recreate()（换主题/缩放）会新建 AccountManager 并可能立刻回调，
+                // 此时本机记录还在异步加载，showCatalog 里 navHiddenAt 一碰 state() 就崩。
+                // 管理模式只操作本机收藏，不因云端刷新打断。
+                if(library.isLoaded && screen=="catalog" && (tab==4 || collection=="resume" || (tab==3 && !favoriteManage))) showCatalog(keepViewport=true)
+            }
         }
         // 三方片源配置与观看历史随主备份一起保存/恢复：本地已有的保留，不覆盖
         thirdStore=ThirdStore(this)
@@ -694,13 +720,14 @@ class MainActivity: Activity() {
         backdropView?.takeIf { backdropBitmap!=null }?.let { root.addView(it,FrameLayout.LayoutParams(-1,-1)) }
         val container=column(); val horizontal=dp(widthDp()*.05f); val vertical=(resources.displayMetrics.heightPixels*.05f).toInt()
         container.setPadding(horizontal,vertical,horizontal,vertical); root.addView(container,FrameLayout.LayoutParams(-1,-1))
-        // 本地测试包（versionName 不含 +构建号）右上角常驻 beta 标记，与正式包区分；播放页不显示
+        // 本地测试包（versionName 不含 +构建号）常驻 beta 标记放左上角（右上角留给网速/时钟），与正式包区分；播放页不显示
         if(!BuildConfig.VERSION_NAME.contains('+')) {
             root.addView(text("beta",12f,accent).apply { importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO; isFocusable=false },
-                FrameLayout.LayoutParams(-2,-2,Gravity.TOP or Gravity.END).apply { topMargin=dp(10); rightMargin=dp(14) })
+                FrameLayout.LayoutParams(-2,-2,Gravity.TOP or Gravity.START).apply { topMargin=dp(10); leftMargin=dp(14) })
         }
         if(title!=null) { val heading=row(); addButton(heading,"‹ 返回") { goBack() }; heading.addView(text(title,22f).apply { setTypeface(null,Typeface.BOLD); gravity=Gravity.CENTER_VERTICAL },lp(0,dp(44)).apply { weight=1f }); container.addView(heading) }
         applyClock()
+        applyNetSpeedOverlay()
         return container
     }
     /** Re-adds the optional top-right clock after every root rebuild; ticks on minute boundaries. */
@@ -713,8 +740,8 @@ class MainActivity: Activity() {
             isFocusable=false; isClickable=false
             setPadding(dp(8),dp(3),dp(8),dp(3))
         }
-        // Local test builds show the beta badge in the same corner; keep both visible.
-        val topMargin=if(BuildConfig.VERSION_NAME.contains('+')) dp(10) else dp(30)
+        // 时钟恢复原位（右上角 dp10）；仅当网速悬浮文字开启时才下移一行避让
+        val topMargin=dp(10)+(if(netSpeedShown()) dp(30) else 0)
         root.addView(view,FrameLayout.LayoutParams(-2,-2,Gravity.TOP or Gravity.END).apply { this.topMargin=topMargin; rightMargin=dp(14) })
         clockView=view
         val tick=object: Runnable {
@@ -725,6 +752,48 @@ class MainActivity: Activity() {
         }
         clockTick=tick
         tick.run()
+    }
+    /**
+     * 右上角顶部实时网速悬浮文字：显示设备总收发速率（↓ 下行 / ↑ 上行），
+     * 设置页「外观与界面」或语音开关，默认关闭。挂在每次 root 重建之后（含播放页），
+     * 贴屏幕最顶端（dp10），纯文字无底色；beta 标记与时钟顺次下移避让，所有界面常显。
+     */
+    /** 网速悬浮文字当前是否应显示：右上角 beta/时钟纵向避让的依据。 */
+    private fun netSpeedShown()=library.isLoaded && library.netSpeed
+    private fun applyNetSpeedOverlay(show: Boolean=library.netSpeed) {
+        netSpeedTick?.let(main::removeCallbacks); netSpeedTick=null
+        if(!library.isLoaded || !show || !library.netSpeed) { netSpeedView?.let { root.removeView(it) }; netSpeedView=null; lastRxBytes=-1; lastTxBytes=-1; return }
+        if(netSpeedView==null) {
+            val view=text("网速 · 测量中…",12f,muted).apply {
+                importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                isFocusable=false; isClickable=false
+                setPadding(dp(8),dp(3),dp(8),dp(3))
+            }
+            root.addView(view,FrameLayout.LayoutParams(-2,-2,Gravity.TOP or Gravity.END).apply { topMargin=dp(10); rightMargin=dp(14) })
+            netSpeedView=view
+        }
+        val tick=object: Runnable {
+            override fun run() {
+                val rx=android.net.TrafficStats.getTotalRxBytes()
+                val tx=android.net.TrafficStats.getTotalTxBytes()
+                if(rx<0 || tx<0) netSpeedView?.text="网速 · 当前设备不支持"
+                else {
+                    if(lastRxBytes>=0 && lastTxBytes>=0) {
+                        netSpeedView?.text="↓ ${speedLabel(rx-lastRxBytes)}   ↑ ${speedLabel(tx-lastTxBytes)}"
+                    }
+                    lastRxBytes=rx; lastTxBytes=tx
+                }
+                main.postDelayed(this,1000L)
+            }
+        }
+        netSpeedTick=tick
+        tick.run()
+    }
+    /** 速率格式化：1 MB/s 以上一位小数，其余整数 KB/s 或 B/s。 */
+    private fun speedLabel(bytesPerSec: Long): String=when {
+        bytesPerSec>=1L shl 20 -> String.format(java.util.Locale.US,"%.1f MB/s",bytesPerSec/1048576f)
+        bytesPerSec>=1024L -> "${bytesPerSec/1024} KB/s"
+        else -> "$bytesPerSec B/s"
     }
     private fun loadCover(view: ImageView,url: String) {
         var ancestor: View?=view
@@ -746,9 +815,21 @@ class MainActivity: Activity() {
     }
     private fun releaseCatalogViews() {
         homeScreen?.let { homePosition=it.capturePosition() }
-        (catalogRecycler?.layoutManager as? GridLayoutManager)?.let { scrollPositions[catalogPageKey]=it.findFirstVisibleItemPosition() }
+        // 保存首个可见卡片的 adapter 位置与像素偏移：账号事件等触发的整页重建用这对值原位恢复视口。
+        // 只存位置不带偏移，恢复后整屏内容会整体上移；只按 displayedIndex 换算则会被分节标题错位。
+        (catalogRecycler?.layoutManager as? GridLayoutManager)?.let { lm ->
+            val recycler=catalogRecycler ?: return
+            val child=lm.getChildAt(0)
+            if(child!=null) {
+                val pos=recycler.getChildAdapterPosition(child)
+                if(pos!=RecyclerView.NO_POSITION) {
+                    scrollPositions[catalogPageKey]=pos
+                    scrollOffsets[catalogPageKey]=child.top-recycler.paddingTop
+                }
+            }
+        }
         homeScreen=null; selectionPreview=null; catalogRecycler=null; catalogAdapter=null; loadingMore=false
-        nav.clear(); segmentFirst=null; typeButtons.clear(); searchInput=null; searchButton=null; searchActions.clear()
+        nav.clear(); segmentFirst=null; segmentChipsByTab=emptyMap(); typeButtons.clear(); searchInput=null; searchButton=null; searchActions.clear()
         azFirst=null; azLastRow.clear(); suggestRow=null; suggestFirst=null; suggestTicket++; main.removeCallbacks(pendingSuggest)
         suggestVertical=false; searchBody=null; keyboardKeys=emptyMap(); keyboardRows=emptyList(); historyFirst=null; historyItems=emptyList(); suggestScrollRef=null; resultFirstCard=null
         historyManage=null; historySync=null; historyRefresh=null; rankSwitch=null; rankRefresh=null; rankSubtitle=null; genreButton=null; genreClear=null; collectionBack=null; favoriteBadges.clear()
@@ -812,7 +893,8 @@ class MainActivity: Activity() {
         newRelease=saved?.newRelease ?: false; newReleaseWindow=saved?.newReleaseWindow ?: newReleaseWindow
         // 续页游标与分类条件跟着页签一起存：上新/高级筛选的 session 不能跨页签复用，否则续页拉到的是别的条件
         discoveryCursor=saved?.cursor; discoverySelection=saved?.discovery ?: discoverySelection
-        showCatalog(load=(next<=2 && catalog.isEmpty() && (next!=1 || query.isNotBlank())))
+        // 我的模块：焦点先落当前页对应的分段按钮（最近观看/收藏），上下键直接切区，不必先进卡片
+        showCatalog(load=(next<=2 && catalog.isEmpty() && (next!=1 || query.isNotBlank())),focusSegment=(next==3||next==4))
         // 切回搜索页时焦点落输入框，避免页面重建后焦点丢失
         if(next==1) searchInput?.requestFocus()
     }
@@ -853,7 +935,7 @@ class MainActivity: Activity() {
             }
         } else library.history().map { it.series }
     }
-    private fun showCatalog(load: Boolean=false,focusNav: Boolean=false,focusType: Boolean=false,focusFilter: Boolean=false) {
+    private fun showCatalog(load: Boolean=false,focusNav: Boolean=false,focusType: Boolean=false,focusFilter: Boolean=false,keepViewport: Boolean=false,focusSegment: Boolean=false) {
         initialCatalogPending=false; restoreStoppedPage=false; pendingDetail=null; pendingCloudResume=null
         // 当前模块被隐藏时回到首页，避免停留在不可见的页签
         if(navHiddenAt(tab)) tab=0
@@ -904,7 +986,7 @@ class MainActivity: Activity() {
         lateinit var quickTool: TextView
         quickTool=button(if(tightNav) "快传" else "手机快传",false) {
             tvTools.quickTransfer(quickTool,{ file,kind -> handleQuickTransfer(file,kind) },{},
-                { tvTools.quickFiles(quickTool,{ f,k -> handleQuickTransfer(f,k) },{ tvTools.quickTransfer(quickTool,{ file,kind -> handleQuickTransfer(file,kind) },{}) },{}) })
+                { tvTools.quickFiles(quickTool,{ f,k -> handleQuickTransfer(f,k,true,quickTool) },{ tvTools.quickTransfer(quickTool,{ file,kind -> handleQuickTransfer(file,kind) },{}) },{}) })
         }.apply { textSize=13f; minHeight=dp(if(tightNav) 36 else 38); val pad=dp(if(tightNav) 10 else 12); setPadding(pad,dp(7),pad,dp(7)) }
         // 遥控入口放在顶栏而不是只在设置里：用户在任何一个列表页看剧时
         // 想换手机操作，都能就地打开，不用退回首页再一路找进设置。
@@ -931,12 +1013,14 @@ class MainActivity: Activity() {
         var segmentChips: List<TextView> =emptyList()
         if(tab in 3..4) {
             val options=listOf(4 to "最近观看",3 to "收藏")
+            val visible=options.filter { !navHiddenAt(it.first) }
             val segRow=row().apply { setPadding(0,0,0,dp(8)) }
-            segmentChips=options.filter { !navHiddenAt(it.first) }.map { (index,label) ->
+            segmentChips=visible.map { (index,label) ->
                 chip(label,index==tab) { if(index!=tab) switchTab(index) }.apply {
                     textSize=14f; minHeight=dp(34); setPadding(dp(16),dp(7),dp(16),dp(7))
                 }
             }
+            segmentChipsByTab=visible.map { it.first }.zip(segmentChips).toMap()
             segmentChips.forEach { segRow.addView(it,lp(-2,-2).apply { rightMargin=dp(6) }) }
             segmentFirst=segmentChips.firstOrNull()
             if(segmentChips.isNotEmpty()) container.addView(segRow)
@@ -1241,12 +1325,48 @@ class MainActivity: Activity() {
             if(tab==3 && !favoriteManage) {
                 favoriteCheck=addButton(heading,"检查更新") {
                     if(favoriteMonitor.running) Toast.makeText(this,"正在检查收藏更新…",Toast.LENGTH_SHORT).show()
-                    else if(library.favorites().isEmpty()) Toast.makeText(this,"先收藏几部剧，再来检查更新",Toast.LENGTH_SHORT).show()
-                    else { favoriteMonitor.check(force=true); Toast.makeText(this,"开始检查收藏更新…",Toast.LENGTH_SHORT).show() }
+                    else if(library.favorites().isEmpty() && !accountManager.signedIn) Toast.makeText(this,"先收藏几部剧，再来检查更新",Toast.LENGTH_SHORT).show()
+                    else {
+                        // 本机收藏逐部查详情；云端收藏顺带对账书架（0 额外请求），两个区一起更新
+                        if(library.favorites().isNotEmpty()) favoriteMonitor.check(force=true)
+                        if(accountManager.signedIn && !accountManager.isBusy) accountManager.refreshFavorites()
+                        Toast.makeText(this,"开始检查收藏更新…",Toast.LENGTH_SHORT).show()
+                    }
                 }.apply { nextFocusUpId=nav[tab].id }
                 favoriteManageButton=addButton(heading,"管理") {
                     favoriteManage=true; favoriteSelected.clear(); showCatalog()
                 }.apply { nextFocusUpId=nav[tab].id }
+            }
+            if(tab==3 && !favoriteManage && accountManager.signedIn) {
+                // 云端收藏与最近观看页同款：只读展示 + 本机收藏手动推云端
+                favoriteCloudRefresh=addButton(heading,"刷新云端收藏") {
+                    if(accountManager.isBusy) Toast.makeText(this,"账号操作进行中，请稍候",Toast.LENGTH_SHORT).show()
+                    else {
+                        Toast.makeText(this,"正在刷新云端收藏…",Toast.LENGTH_SHORT).show()
+                        accountManager.refreshFavorites {
+                            favoriteCloudRefresh?.takeIf { it.isAttachedToWindow }?.requestFocus()
+                        }
+                        main.postDelayed({ favoriteCloudRefresh?.takeIf { it.isAttachedToWindow }?.requestFocus() }, 600)
+                    }
+                }.apply {
+                    id=View.generateViewId()
+                    nextFocusUpId=nav[tab].id
+                    if(accountManager.isBusy) { isEnabled=false; alpha=.4f }
+                }
+                favoriteCloudSync=addButton(heading,"同步到云端") {
+                    accountManager.syncFavoritesToCloud { pushed,skipped,failed ->
+                        val message=buildString {
+                            append(if(pushed>0) "已上传 $pushed 部到云端" else "云端已是最新，无需上传")
+                            if(skipped>0) append("；$skipped 部云端已有或无法同步")
+                            if(failed>0) append("；$failed 部上传失败，可稍后重试")
+                        }
+                        tvTools.info("收藏同步完成",message,favoriteCloudSync)
+                    }
+                }.apply {
+                    id=View.generateViewId()
+                    nextFocusUpId=nav[tab].id
+                    if(accountManager.isBusy) { isEnabled=false; alpha=.4f }
+                }
             }
             if(tab==3 && favoriteManage) {
                 favoriteSelectAll=addButton(heading,if(favoriteSelected.size==catalog.size && catalog.isNotEmpty()) "取消全选" else "全选") {
@@ -1417,11 +1537,16 @@ class MainActivity: Activity() {
                     if(resumeCards.isNotEmpty()) resumeCards.first().requestFocus()
                 }
             })
-        } else catalogGrid(body,focusNav,focusType,focusFilter=focusFilter)
+        } else catalogGrid(body,focusNav,focusType,focusFilter=focusFilter,keepViewport=keepViewport,focusSegment=focusSegment)
         // 页面重建后初始化联想区：回显点击联想词前的列表，或无词时收起中栏
         if(tab==1 && !advancedSearch) fetchSuggest()
     }
-    private fun catalogGrid(body: LinearLayout,focusNav: Boolean,focusType: Boolean=false,loading: Boolean=false,focusFilter: Boolean=false) {
+    private fun catalogGrid(body: LinearLayout,focusNav: Boolean,focusType: Boolean=false,loading: Boolean=false,focusFilter: Boolean=false,keepViewport: Boolean=false,focusSegment: Boolean=false) {
+        // keepViewport：后台事件（云端数据到达）触发的重建，用户可能正在浏览页面。
+        // 此时不走 catalogFocus 优先的常规恢复——鼠标滚轮不移动焦点，catalogFocus 停在进页首卡，
+        // 常规恢复会把整屏弹回顶部（issue #19.2）；改按 scrollPositions+scrollOffsets 原位恢复。
+        // hadGridFocus 必须在下方 gridFocusOwned=false 之前捕获：焦点原在网格内才回网格。
+        val hadGridFocus=gridFocusOwned
         if(tab==0 && page==1 && collection==null && genre==null) { renderHome(body,focusNav,focusType,loading); return }
         collectionBack=null; genreClear=null
         if(collection!=null) {
@@ -1456,10 +1581,18 @@ class MainActivity: Activity() {
         val preview=SeriesPreview(this); selectionPreview=preview; body.addView(preview)
         val displayed=mutableListOf<Series>()
         displayed+=if(localCatalog()) catalog else if(tab==0) catalog.filterNot { it.id in library.hidden() } else catalog
-        // 最近观看页：本机记录在前；登录且有云端记录时追加「云端记录」区，同剧可在两区各出现一次
+        // 最近观看/收藏页：本机记录在前；登录且有云端数据时追加「云端记录/云端收藏」区，同剧可在两区各出现一次
         val cloudRows=if(tab==4 && collection==null && accountManager.signedIn) accountManager.cloudRows() else emptyList()
+        val cloudFavs=if(tab==3 && !favoriteManage && collection==null && accountManager.signedIn) accountManager.cloudFavoriteRows() else emptyList()
+        // 已登录但云端收藏还没拉到（启动时拉取失败等）：进页面顺手补拉一次，完成后 onAccountChanged 重建展示
+        if(tab==3 && !favoriteManage && collection==null && accountManager.signedIn &&
+            !accountManager.cloudFavoritesLoaded && !accountManager.isBusy) accountManager.refreshFavorites()
+        // 云端收藏的续播角标来自云端观看记录：没拉到同样顺手补拉，拉到后经签名变化重建
+        if(tab==3 && !favoriteManage && collection==null && accountManager.signedIn &&
+            !accountManager.cloudHistoryLoaded && !accountManager.isBusy) accountManager.refreshHistory()
         val localCount=displayed.size
         if(cloudRows.isNotEmpty()) displayed+=cloudRows.map { it.series }
+        if(cloudFavs.isNotEmpty()) displayed+=cloudFavs.map { it.series }
         if(displayed.isEmpty()) {
             message(body,if(loading) "正在加载推荐…" else when(tab) { 1 -> if(advancedSearch) "当前条件下没有内容，可以换个条件或点「重置」" else if(query.isBlank()) "输入名称关键词，或用字母键拼首拼选择联想词" else "没有找到相关${library.contentType.label}，换个关键词试试"; 2 -> if(newRelease) "${newReleaseLabel()}内暂无${rankBoard.label}上新，按「时间」换成更长的范围" else "本页没有更多内容"; 3 -> if(favoriteGroupFilter!=null) "「$favoriteGroupFilter」分组暂无收藏" else "在剧集详情中选择收藏，喜欢的剧就会出现在这里"; 4 -> "播放过的剧集会自动保存在这里"; else -> "本页没有更多内容" })
             wireSearchPanel(null)
@@ -1476,24 +1609,58 @@ class MainActivity: Activity() {
                 put(localCount+if(localCount>0) 1 else 0,"云端记录")
             }
         }
+        if(cloudFavs.isNotEmpty()) {
+            adapter.cloudFavs=cloudFavs
+            adapter.cloudFavStart=localCount
+            adapter.headers=buildMap {
+                if(localCount>0) put(0,"本机收藏")
+                // 云端区标题聚合上新计数：进来一眼看到有多少部更新
+                val cloudUpdates=library.updatedCloudFavorites()+library.cloudNewCount()
+                put(localCount+if(localCount>0) 1 else 0,"云端收藏"+if(cloudUpdates>0) " · $cloudUpdates 部有更新" else "")
+            }
+        }
         val grid=GridLayoutManager(this,cols)
         grid.spanSizeLookup=object: GridLayoutManager.SpanSizeLookup() { override fun getSpanSize(position: Int)=if(adapter.isFooter(position) || adapter.isHeader(position)) cols else 1 }
         val recycler=RecyclerView(this).apply {
             id=View.generateViewId(); clipToPadding=false; isVerticalScrollBarEnabled=false; itemAnimator=null
             layoutManager=grid; this.adapter=adapter
-            // Focus entering the grid lands on the first visible card, keeping the user's place.
+            // Focus entering the grid lands on the first visible CARD, keeping the user's place.
+            // 首个可见项可能是分节标题（不可聚焦）：不跳过的话焦点停在 RecyclerView 本身，↓ 键从此失灵。
             isFocusable=true; isFocusableInTouchMode=true
-            setOnFocusChangeListener { _,focused -> if(focused) { val first=grid.findFirstVisibleItemPosition().coerceAtLeast(0); post { findViewHolderForAdapterPosition(first)?.itemView?.requestFocus() } } }
+            setOnFocusChangeListener { _,focused -> if(focused && pendingGridFocusPos==RecyclerView.NO_POSITION) {
+                // 跨区移动（pendingGridFocusPos 已挂）时焦点会暂时收到 RecyclerView 本身防首页闪跳，
+                // 此时不能抢落首卡，等 attemptPendingFocus 落到目标卡
+                var first=grid.findFirstVisibleItemPosition().coerceAtLeast(0)
+                while(first<adapter.itemCount && (adapter.isHeader(first) || adapter.isFooter(first))) first++
+                post { findViewHolderForAdapterPosition(first)?.itemView?.requestFocus() }
+            } }
             // 下键统一在 MainActivity.dispatchKeyEvent 里处理：网格重排/分页时 View 层收不到按键
         }
-        catalogRecycler=recycler; catalogAdapter=adapter; catalogFocusPos=RecyclerView.NO_POSITION; gridFocusOwned=false
+        catalogRecycler=recycler; catalogAdapter=adapter; catalogFocusPos=RecyclerView.NO_POSITION; gridFocusOwned=false; pendingGridFocusPos=RecyclerView.NO_POSITION
         recycler.viewTreeObserver.addOnGlobalFocusChangeListener { o,n ->
+            // n===recycler：跨区移动把焦点暂存到 RecyclerView 本身（防首页闪跳），不算掉出网格。
+            // 注意不能对 recycler 自己调 getChildAdapterPosition——它挂的是父容器 LinearLayout
+            // 的 LayoutParams，强转 RecyclerView.LayoutParams 会 ClassCastException 崩溃。
             if(n!=null && inCatalogGrid(n,recycler)) {
-                val pos=recycler.getChildAdapterPosition(n)
-                if(pos!=RecyclerView.NO_POSITION) { catalogFocusPos=pos; gridFocusOwned=true }
-            } else if(o!=null && inCatalogGrid(o,recycler)) gridFocusOwned=false
+                if(n===recycler) {
+                    gridFocusOwned=true
+                } else {
+                    val pos=recycler.getChildAdapterPosition(n)
+                    if(pos!=RecyclerView.NO_POSITION) {
+                        catalogFocusPos=pos; gridFocusOwned=true
+                        if(pos==pendingGridFocusPos) pendingGridFocusPos=RecyclerView.NO_POSITION
+                    }
+                }
+            } else if(o!=null && o!==recycler && inCatalogGrid(o,recycler)) {
+                gridFocusOwned=false
+                // 焦点卡在跨区移动中被滚出屏幕回收：把焦点抓到移动目标上，别让它落去顶栏，
+                // 也别让恢复逻辑把焦点抢回原卡、把刚滚出来的距离再滚回去（两者互搏=按了没反应）。
+                if(pendingGridFocusPos!=RecyclerView.NO_POSITION) grabPendingFocus()
+            }
             // 旧焦点为 null：焦点卡在重排中被回收，立刻补回网格，别停在顶栏「首页」
-            else if(o==null && gridFocusOwned) restoreCatalogFocus()
+            else if(o==null && gridFocusOwned) {
+                if(pendingGridFocusPos!=RecyclerView.NO_POSITION) grabPendingFocus() else restoreCatalogFocus()
+            }
         }
         adapter.footer=when {
             localCatalog() -> if(collection=="hot" && collectionReturn?.hasMore==true) FOOTER_MORE_HOT else FOOTER_NONE
@@ -1550,12 +1717,23 @@ class MainActivity: Activity() {
         wireFilterPanelToGrid(recycler)
         if(focusType) typeButtons[library.contentType]?.requestFocus() else if(focusNav) nav[tab].requestFocus()
         else if(focusFilter && favoriteFilterButtons.isNotEmpty()) favoriteFilterButtons[favoriteFilterFocus.coerceIn(0,favoriteFilterButtons.size-1)].requestFocus()
+        else if(focusSegment && segmentChipsByTab.containsKey(tab)) segmentChipsByTab[tab]?.requestFocus()
         else {
-            val found=displayed.indexOfFirst { it.id==catalogFocus }
-            val target=if(found>=0) found else scrollPositions[catalogPageKey]?.coerceIn(0,displayed.size-1) ?: 0
-            val targetAdapter=adapter.adapterPosition(target)
-            grid.scrollToPositionWithOffset(targetAdapter,0)
-            recycler.post { if(catalogRecycler===recycler) recycler.findViewHolderForAdapterPosition(targetAdapter)?.itemView?.requestFocus() }
+            if(keepViewport) {
+                // 原位恢复：回到重建前同一位置、同一像素偏移。savedPos 是 adapter 位置（含分节标题），
+                // 不能再走 displayedIndex 换算；数据变短时夹到末尾。
+                val savedPos=scrollPositions[catalogPageKey]
+                val targetAdapter=if(savedPos!=null && savedPos>=0) savedPos.coerceIn(0,(adapter.itemCount-1).coerceAtLeast(0)) else 0
+                val focusPos=if(adapter.isHeader(targetAdapter) && targetAdapter+1<adapter.itemCount) targetAdapter+1 else targetAdapter
+                grid.scrollToPositionWithOffset(targetAdapter,scrollOffsets[catalogPageKey] ?: 0)
+                recycler.post { if(catalogRecycler===recycler && hadGridFocus) recycler.findViewHolderForAdapterPosition(focusPos)?.itemView?.requestFocus() }
+            } else {
+                val found=displayed.indexOfFirst { it.id==catalogFocus }
+                val target=if(found>=0) found else scrollPositions[catalogPageKey]?.coerceIn(0,displayed.size-1) ?: 0
+                val targetAdapter=adapter.adapterPosition(target)
+                grid.scrollToPositionWithOffset(targetAdapter,0)
+                recycler.post { if(catalogRecycler===recycler) recycler.findViewHolderForAdapterPosition(targetAdapter)?.itemView?.requestFocus() }
+            }
         }
     }
     private fun inCatalogGrid(view: View,recycler: RecyclerView): Boolean {
@@ -1579,9 +1757,10 @@ class MainActivity: Activity() {
                 if(pos!=RecyclerView.NO_POSITION && !adapter.isHeader(pos) && !adapter.isFooter(pos)) {
                     val index=adapter.displayedIndex(pos)
                     if(index in 0 until adapter.displayed.size) {
-                        val cols=(recycler.layoutManager as? GridLayoutManager)?.spanCount ?: 1
-                        val target=index+cols
-                        if(target<=adapter.displayed.size-1) moveGridFocus(adapter.adapterPosition(target))
+                        val target=adapter.gridNeighbor(index,1)
+                        // 目标不存在（已是最后一行）也吃掉按键：别让焦点掉出网格
+                        if(target>=0) moveGridFocus(adapter.adapterPosition(target))
+                        else pendingGridFocusPos=RecyclerView.NO_POSITION
                         return true
                     }
                 }
@@ -1607,9 +1786,8 @@ class MainActivity: Activity() {
                 if(pos!=RecyclerView.NO_POSITION && !adapter.isHeader(pos) && !adapter.isFooter(pos)) {
                     val index=adapter.displayedIndex(pos)
                     if(index in 0 until adapter.displayed.size) {
-                        val cols=(recycler.layoutManager as? GridLayoutManager)?.spanCount ?: 1
-                        val target=index-cols
-                        if(target>=0 && target in adapter.displayed.indices) moveGridFocus(adapter.adapterPosition(target))
+                        val target=adapter.gridNeighbor(index,-1)
+                        if(target>=0) moveGridFocus(adapter.adapterPosition(target))
                         else {
                             // 首行：先回本页的菜单按钮（排行榜的看榜/刷新、搜索的输入行），
                             // 再按键才回顶栏；不再一步跳到顶部菜单栏。
@@ -1632,26 +1810,70 @@ class MainActivity: Activity() {
         }
         return false
     }
-    /** 把焦点移到网格内指定 adapter 位置：已布局直接移，未布局先滚动再补焦点 */
+    /** 把焦点移到网格内指定 adapter 位置：已布局直接移，未布局先滚动再补焦点（跨分节标题时一行的滚动量不够，最多补三行）。 */
     private fun moveGridFocus(pos: Int) {
         val recycler=catalogRecycler ?: return
-        val holder=recycler.findViewHolderForAdapterPosition(pos)
-        if(holder!=null) { holder.itemView.requestFocus(); return }
+        pendingGridFocusPos=pos
+        if(focusGridPos(pos)) { pendingGridFocusPos=RecyclerView.NO_POSITION; return }
         // 目标在屏幕外：只按一行高度滚动。用 scrollToPosition 会把目标整行锚到顶部，
         // 当前焦点卡瞬间被滚出屏幕并回收，焦点被清空后框架直接回落到顶栏「首页」。
         // 滚动方向必须跟着目标走：向上找目标时要往回滚，否则上一行永远进不了布局。
+        // 焦点被回收由 grabPendingFocus 兜底接住（优先聚焦目标，而不是抢回原卡）。
         val focused=recycler.focusedChild
-        if(focused!=null) {
-            val margin=(focused.layoutParams as? RecyclerView.LayoutParams)?.let { it.topMargin+it.bottomMargin } ?: 0
-            val step=focused.height+margin
-            val current=recycler.getChildAdapterPosition(focused)
-            val downward=current!=RecyclerView.NO_POSITION && pos>current
-            recycler.scrollBy(0,if(downward) step else -step)
-        } else recycler.scrollToPosition(pos)
+        if(focused==null) { recycler.scrollToPosition(pos); recycler.post { attemptPendingFocus(pos,0) }; return }
+        // 跨分节移动要滚不止一行，滚动中原焦点卡会被回收、焦点被清空，
+        // 框架兜底落到窗口第一个可聚焦项（顶栏「首页」）→ 用户看到首页高亮一闪而逝。
+        // 滚动前把焦点收到 RecyclerView 本身（可聚焦、无高亮），滚动全程没有子卡焦点可丢；
+        // 落目标时 attemptPendingFocus 再把焦点交还卡片。focus listener 侧有 pending 守卫不抢活。
+        // 注意 RecyclerView 构造时是 FOCUS_AFTER_DESCENDANTS，直接 requestFocus 会先去聚焦
+        // 第一个可见子卡（错误落点）；要临时切成 FOCUS_BEFORE_DESCENDANTS 强制落在自身。
+        recycler.descendantFocusability=ViewGroup.FOCUS_BEFORE_DESCENDANTS
+        recycler.requestFocus()
+        recycler.descendantFocusability=ViewGroup.FOCUS_AFTER_DESCENDANTS
+        val margin=(focused.layoutParams as? RecyclerView.LayoutParams)?.let { it.topMargin+it.bottomMargin } ?: 0
+        val step=focused.height+margin
+        val current=recycler.getChildAdapterPosition(focused)
+        val downward=current!=RecyclerView.NO_POSITION && pos>current
+        recycler.scrollBy(0,if(downward) step else -step)
+        recycler.post { attemptPendingFocus(pos,if(downward) step else -step) }
+    }
+    /** 跨区移动中焦点被回收的兜底：优先把焦点抓到 pending 目标卡上。 */
+    private fun grabPendingFocus() {
+        val pos=pendingGridFocusPos
+        if(pos==RecyclerView.NO_POSITION) { restoreCatalogFocus(); return }
+        val recycler=catalogRecycler ?: return
         recycler.post {
-            if(screen!="catalog" || recycler!==catalogRecycler) return@post
-            recycler.findViewHolderForAdapterPosition(pos)?.itemView?.requestFocus()
+            if(screen!="catalog" || recycler!==catalogRecycler || recycler.focusedChild!=null) return@post
+            if(focusGridPos(pos)) { pendingGridFocusPos=RecyclerView.NO_POSITION; return@post }
+            // 目标还没进布局：锚过去再试一次
+            recycler.scrollToPosition(pos)
+            recycler.post {
+                if(focusGridPos(pos)) pendingGridFocusPos=RecyclerView.NO_POSITION
+            }
         }
+    }
+    /** moveGridFocus 的补焦循环：目标可见则落焦点，否则继续滚（最多三行）。 */
+    private fun attemptPendingFocus(pos: Int, step: Int) {
+        val recycler=catalogRecycler ?: return
+        if(screen!="catalog" || recycler!==catalogRecycler) return
+        if(focusGridPos(pos)) { pendingGridFocusPos=RecyclerView.NO_POSITION; return }
+        var tries=0
+        fun attempt() {
+            if(screen!="catalog" || recycler!==catalogRecycler) return
+            if(focusGridPos(pos)) { pendingGridFocusPos=RecyclerView.NO_POSITION; return }
+            if(tries<3) { tries++; recycler.scrollBy(0,step); recycler.post { attempt() } }
+        }
+        attempt()
+    }
+    /** 网格内目标位置当前可见且已挂窗则聚焦，返回是否真的落上焦点。 */
+    private fun focusGridPos(pos: Int): Boolean {
+        val recycler=catalogRecycler ?: return false
+        val view=recycler.findViewHolderForAdapterPosition(pos)?.itemView ?: return false
+        // scrap/待布局的 holder 可能还没 attach：对它 requestFocus 是假成功，焦点随后会被框架抢走
+        if(!view.isAttachedToWindow) return false
+        val took=view.requestFocus()
+        if(!took) return false
+        return recycler.focusedChild===view || recycler.focusedChild?.parent===view
     }
     /** 记住当前焦点卡位置，供列表结构变更（footer 插入/移除、分页插入）后补回焦点，避免掉到顶栏首页 */
     private fun rememberCatalogFocus() {
@@ -1717,7 +1939,17 @@ class MainActivity: Activity() {
             }
         })
     }
-    private inner class CardHolder(val card: LinearLayout,val artwork: FrameLayout,val image: ImageView,val rank: TextView,val title: TextView,val badge: TextView): RecyclerView.ViewHolder(card) {
+    /** 从新季标题提取季数（《xxx 2》/ 第2季 / 第二季）；提取不出返回 null，角标退化为「新季已上线」。 */
+    private fun seasonNumberOf(title: String?): Int? {
+        if(title.isNullOrBlank()) return null
+        Regex("第\\s*([0-9]+)\\s*季").find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        Regex("第\\s*([一二三四五六七八九])\\s*季").find(title)?.groupValues?.get(1)?.let { return "一二三四五六七八九".indexOf(it)+1 }
+        if(Regex("第\\s*十\\s*季").containsMatchIn(title)) return 10
+        Regex("(\\d+)\\s*$").find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return if(it in 2..99) it else null }
+        return null
+    }
+
+    private inner class CardHolder(val card: LinearLayout,val artwork: FrameLayout,val image: ImageView,val rank: TextView,val title: TextView,val badge: TextView,val updateTag: TextView): RecyclerView.ViewHolder(card) {
         var boundId=""
     }
     private inner class CatalogAdapter(val displayed: MutableList<Series>,val cols: Int): RecyclerView.Adapter<RecyclerView.ViewHolder>() {
@@ -1727,6 +1959,9 @@ class MainActivity: Activity() {
         /** displayed 中云端区的起始下标；云端卡角标、徽标与点击续播都走云端进度。 */
         var cloudStart=Int.MAX_VALUE
         var cloudRows: List<CloudProgress> = emptyList()
+        /** 收藏页云端区：只读展示，卡片可带云端进度角标。 */
+        var cloudFavs: List<CloudFavorite> = emptyList()
+        var cloudFavStart=Int.MAX_VALUE
         fun isHeader(position: Int)=headers.containsKey(position)
         fun isFooter(position: Int)=footer!=FOOTER_NONE && position==displayed.size+headers.size
         /** adapter 位置 → displayed 下标（前面每有一个分节标题就减一）。 */
@@ -1741,6 +1976,14 @@ class MainActivity: Activity() {
             for(key in headers.keys.sorted()) if(key<=position) position++
             return position
         }
+        /** displayed 下标 i 前面是否紧贴一个分节标题（标题独占一行，网格行计算要跳过）。 */
+        private fun sectionStart(index: Int): Boolean {
+            if(index<=0) return false
+            return headers.containsKey(adapterPosition(index)-1)
+        }
+        /** 同列上/下一视觉行的卡片下标：跨「本机/云端」分节标题无缝移动，没有则 -1。 */
+        fun gridNeighbor(index: Int, dir: Int): Int =
+            GridNav.neighbor(GridNav.coordinates(displayed.size,cols,::sectionStart),index,dir)
         override fun getItemCount()=displayed.size+headers.size+if(footer!=FOOTER_NONE) 1 else 0
         override fun getItemViewType(position: Int)=if(isHeader(position)) TYPE_HEADER else if(isFooter(position)) TYPE_FOOTER else TYPE_CARD
         fun updateFooter(next: Int) {
@@ -1774,6 +2017,9 @@ class MainActivity: Activity() {
             artwork.addView(image,FrameLayout.LayoutParams(-1,-1))
             val rank=TextView(this@MainActivity).apply { textSize=11f; setTypeface(null,Typeface.BOLD); setPadding(dp(8),dp(4),dp(8),dp(4)) }
             artwork.addView(rank,FrameLayout.LayoutParams(-2,-2,Gravity.TOP or Gravity.START))
+            // 云端收藏上新角标（已更新 N 集 / 第 X 季已上线 / 新收藏）：挂在海报右上角
+            val updateTag=TextView(this@MainActivity).apply { textSize=11f; setTypeface(null,Typeface.BOLD); setPadding(dp(8),dp(4),dp(8),dp(4)); visibility=View.GONE }
+            artwork.addView(updateTag,FrameLayout.LayoutParams(-2,-2,Gravity.TOP or Gravity.END))
             // 部分机型单行/两行标题实测行高不一致，minLines 保底失效；用换行探针实测两行高度并固定，热度/集数标签才能对齐
             val title=text("测\n测",14f).apply { gravity=Gravity.TOP; includeFontPadding=true; maxLines=2; ellipsize=TextUtils.TruncateAt.END; setPadding(dp(3),dp(7),dp(3),0) }
             title.measure(View.MeasureSpec.makeMeasureSpec(0,View.MeasureSpec.UNSPECIFIED),View.MeasureSpec.makeMeasureSpec(0,View.MeasureSpec.UNSPECIFIED))
@@ -1783,7 +2029,7 @@ class MainActivity: Activity() {
             card.addView(title,lp(-1,titleHeight))
             card.addView(badge,lp(-1,-2))
             card.layoutParams=RecyclerView.LayoutParams(-1,-2).apply { rightMargin=dp(14); bottomMargin=dp(10) }
-            return CardHolder(card,artwork,image,rank,title,badge)
+            return CardHolder(card,artwork,image,rank,title,badge,updateTag)
         }
         override fun onBindViewHolder(holder: RecyclerView.ViewHolder,position: Int) {
             if(getItemViewType(position)==TYPE_HEADER) { (holder.itemView as TextView).text=headers[position]; return }
@@ -1792,6 +2038,34 @@ class MainActivity: Activity() {
             val di=displayedIndex(position)
             val item=displayed[di]; holder.boundId=item.id
             val cloudRow=if(di>=cloudStart) cloudRows.getOrNull(di-cloudStart) else null
+            val cloudFav=if(di>=cloudFavStart) cloudFavs.getOrNull(di-cloudFavStart) else null
+            val cloudFavProgress=if(cloudFav!=null) accountManager.cloudRows().firstOrNull { it.series.id==item.id } else null
+            // 云端优先；云端记录还没拉到/没这部时退回本机播放记录，一样能续播
+            val cloudFavLocalResume=if(cloudFav!=null && cloudFavProgress==null) library.progress(item.id) else null
+            val cloudFavResumeLabel=when {
+                cloudFavProgress!=null -> "第 ${cloudFavProgress.episodeIndex+1} 集 · ${formatTime(cloudFavProgress.position)}"
+                cloudFavLocalResume!=null -> "第 ${cloudFavLocalResume.episodeIndex+1} 集 · ${formatTime(cloudFavLocalResume.position)}"
+                else -> null
+            }
+            val cloudFavCanResume=cloudFavProgress!=null || cloudFavLocalResume!=null
+            // 云端收藏上新状态：加更琥珀、新季/新收藏红；角标挂海报右上，副标题行同步提示
+            val cloudFavUpdate=cloudFav?.let { library.cloudUpdate(it.series.id) }
+            val cloudFavAdded=cloudFavUpdate?.added ?: 0
+            val cloudFavNew=cloudFav!=null && library.isCloudNew(item.id)
+            val cloudFavSeason=cloudFavUpdate?.takeIf { it.hasNewSeason }
+            val cloudFavTag=when {
+                cloudFav==null -> null
+                cloudFavSeason!=null -> seasonNumberOf(cloudFavSeason.newSeasonTitle)?.let { "第$it 季已上线" } ?: "新季已上线"
+                cloudFavAdded>0 -> "已更新 $cloudFavAdded 集"
+                cloudFavNew -> "新收藏"
+                else -> null
+            }
+            val cloudFavSuffix=when {
+                cloudFavSeason!=null -> "《${cloudFavSeason.newSeasonTitle ?: "新季"}》已上线"
+                cloudFavAdded>0 -> "+$cloudFavAdded 集更新"
+                cloudFavNew -> "新收藏"
+                else -> ""
+            }
             if(di==0) resultFirstCard=holder.card
             val card=holder.card
             card.tag=item.id; card.contentDescription=item.title
@@ -1813,33 +2087,49 @@ class MainActivity: Activity() {
                 holder.rank.background=rounded(if(rank==1) accent else Color.argb(235,255,255,255),6)
                 holder.rank.visibility=View.VISIBLE
                 card.contentDescription="$rankLabel，${item.title}，${rankPosition?.heat?.ifBlank { "热度暂无" } ?: "热度暂无"}"
-            } else if(cloudRow!=null) {
-                // 云端记录角标：与本机记录同剧并存时一眼可辨
+            } else if(cloudRow!=null || cloudFav!=null) {
+                // 云端卡角标：与本机同剧并存时一眼可辨
                 holder.rank.text="云端"
                 holder.rank.setTextColor(white)
                 holder.rank.background=rounded(accent,6)
                 holder.rank.visibility=View.VISIBLE
-                card.contentDescription="云端记录，${item.title}，第 ${cloudRow.episodeIndex+1} 集"
+                card.contentDescription=if(cloudRow!=null) "云端记录，${item.title}，第 ${cloudRow.episodeIndex+1} 集" else "云端收藏，${item.title}"
             } else holder.rank.visibility=View.GONE
+            if(cloudFavTag!=null) {
+                val urgent=cloudFavSeason!=null || cloudFavNew
+                holder.updateTag.text=cloudFavTag
+                holder.updateTag.setTextColor(if(urgent) Color.rgb(121,31,31) else Color.rgb(99,56,6))
+                holder.updateTag.background=rounded(if(urgent) Color.rgb(247,193,193) else Color.rgb(250,222,166),6)
+                holder.updateTag.visibility=View.VISIBLE
+                card.contentDescription="$cloudFavTag，${card.contentDescription}"
+            } else holder.updateTag.visibility=View.GONE
             holder.title.text=item.title
             val progress=if(tab==4 || collection=="resume") library.progress(item.id) else null
             // 收藏管理模式：角标前缀 ✓ 表示已勾选，确认键只切换勾选不进详情
             val managePicked=tab==3 && favoriteManage && item.id in favoriteSelected
-            holder.badge.text=if(cloudRow!=null) "第 ${cloudRow.episodeIndex+1} 集 · ${formatTime(cloudRow.position)} · 云端" else if(tab==3) (if(favoriteManage && managePicked) "✓ " else "")+library.favoriteLabel(item.id) else if(ranked) rankPosition?.heat?.ifBlank { "热度暂无" } ?: "热度暂无" else if(progress!=null) if(library.watched(item.id)) "整剧已看完" else "第 ${progress.episodeIndex+1} 集 · ${formatTime(progress.position)}" else item.badge
+            holder.badge.text=if(cloudRow!=null) "第 ${cloudRow.episodeIndex+1} 集 · ${formatTime(cloudRow.position)} · 云端" else if(cloudFav!=null) (cloudFavResumeLabel?.let { "$it · " } ?: "")+(if(cloudFavUpdate!=null) "更新至 ${cloudFavUpdate.total} 集" else "尚未检查更新")+if(cloudFavSuffix.isEmpty()) "" else " · $cloudFavSuffix" else if(tab==3) (if(favoriteManage && managePicked) "✓ " else "")+library.favoriteLabel(item.id) else if(ranked) rankPosition?.heat?.ifBlank { "热度暂无" } ?: "热度暂无" else if(progress!=null) if(library.watched(item.id)) "整剧已看完" else "第 ${progress.episodeIndex+1} 集 · ${formatTime(progress.position)}" else item.badge
             holder.badge.setTextColor(if(managePicked) gold else if(ranked || tab==3) accent else muted)
-            if(tab==3 && !favoriteManage) favoriteBadges[item.id]=holder.badge
+            // 只登记本机收藏卡的角标：同剧在云端区再出现一次时不能登记（favoriteBadges 按 id 存、
+            // 后绑定的会覆盖前一个，刷新本机 label 会把文字写进云端卡的角标）
+            if(tab==3 && !favoriteManage && cloudFav==null) favoriteBadges[item.id]=holder.badge
             card.setOnClickListener {
                 catalogFocus=item.id
                 if(tab==3 && favoriteManage) {
                     if(!favoriteSelected.remove(item.id)) favoriteSelected+=item.id
                     catalogAdapter?.notifyItemChanged(position); refreshFavoriteManageBar()
-                } else if(cloudRow!=null) openDetail(item,true,cloud=cloudRow) else openDetail(item,tab==4 || collection=="resume" || collection=="updates")
+                } else if(cloudRow!=null) openDetail(item,true,cloud=cloudRow) else if(cloudFav!=null) {
+                    // 点进详情即视为看过：重置上新基线、清掉角标与「新收藏」标记
+                    library.acknowledgeCloudFavorite(item.id, CloudAccountClient.episodeTotal(item.badge), System.currentTimeMillis())
+                    catalogAdapter?.notifyItemChanged(position)
+                    // 云端记录优先续播；没有就用本机播放记录（云端收藏不等于没看过）
+                    openDetail(item,cloudFavCanResume,cloud=cloudFavProgress)
+                } else openDetail(item,tab==4 || collection=="resume" || collection=="updates")
             }
             card.setOnLongClickListener { catalogFocus=item.id; quickActions(item,card); true }
             card.setOnKeyListener { _,key,event -> if(key==KeyEvent.KEYCODE_MENU) { if(event.action==KeyEvent.ACTION_UP) { catalogFocus=item.id; quickActions(item,card) }; true } else false }
             card.setOnFocusChangeListener { _,focused -> card.background=TvStyle.card(this@MainActivity,focused); if(focused) { catalogFocus=item.id; loadCover(holder.image,item.cover); selectionPreview?.show(item,selectionStatus(item)) } }
             // 高级搜索下 searchInput 未挂载但非空，会让 Elvis 链提前命中导致 ↑ 回不到筛选面板，故面板分支必须放最前
-            card.nextFocusUpId=if(di<cols) (if(tab==1 && advancedSearch) filterRows.lastOrNull()?.firstOrNull()?.id else null) ?: suggestFirst?.id ?: historyFirst?.id ?: azLastRow.firstOrNull()?.id ?: searchInput?.id ?: collectionBack?.id ?: genreClear?.id ?: typeButtons[library.contentType]?.id ?: rankSwitch?.id ?: rankRefresh?.id ?: favoriteSelectAll?.id ?: favoriteSortFirst?.id ?: favoriteFilterFirst?.id ?: favoriteCheck?.id ?: historySync?.id ?: historyManage?.id ?: nav[tab].id else View.NO_ID
+            card.nextFocusUpId=if(di<cols) (if(tab==1 && advancedSearch) filterRows.lastOrNull()?.firstOrNull()?.id else null) ?: suggestFirst?.id ?: historyFirst?.id ?: azLastRow.firstOrNull()?.id ?: searchInput?.id ?: collectionBack?.id ?: genreClear?.id ?: typeButtons[library.contentType]?.id ?: rankSwitch?.id ?: rankRefresh?.id ?: favoriteSelectAll?.id ?: favoriteSortFirst?.id ?: favoriteFilterFirst?.id ?: favoriteCloudRefresh?.id ?: favoriteCheck?.id ?: historySync?.id ?: historyManage?.id ?: nav[tab].id else View.NO_ID
             if(di>=displayed.size-12) catalogRecycler?.post { maybeLoadMore() }
         }
         override fun onViewRecycled(holder: RecyclerView.ViewHolder) {
@@ -2160,6 +2450,12 @@ class MainActivity: Activity() {
             clockButton.text="显示系统时间  ·  ${if(library.showClock) "开启" else "关闭"}"
             applyClock()
         }
+        lateinit var netSpeedButton: TextView
+        netSpeedButton=setting(look,"网速显示  ·  ${if(library.netSpeed) "开启" else "关闭"}") {
+            library.netSpeed=!library.netSpeed
+            netSpeedButton.text="网速显示  ·  ${if(library.netSpeed) "开启" else "关闭"}"
+            applyNetSpeedOverlay()
+        }
         lateinit var backdropButton: TextView
         fun backdropLabel()="自定义背景  ·  ${if(backdropFile()!=null) "已启用" else if(backdropStyle()=="forced") "强制欣赏" else "默认风格"}"
         backdropButton=setting(look,backdropLabel()) {
@@ -2252,6 +2548,8 @@ class MainActivity: Activity() {
         remoteAddressButton=setting(lab,"遥控地址  ·  自动化 / 语音桥接") { showRemoteAddress(remoteAddressButton) }
         lateinit var xiaoAiButton: TextView
         xiaoAiButton=setting(lab,xiaoAiLabel()) { showXiaoAiDialog(xiaoAiButton) }
+        lateinit var proxyButton: TextView
+        proxyButton=setting(lab,proxyLabel()) { showProxyDialog(proxyButton) }
         heading(about,"关于红果",categories[4].second)
         lateinit var updates: TextView
         updates=setting(about,"版本与更新  ·  ${BuildConfig.VERSION_NAME}") { updater.show(updates) }
@@ -2685,12 +2983,12 @@ class MainActivity: Activity() {
     }
     private fun showRandomPicks() {
         if(randomDialog?.isShowing==true) return
-        val picks=randomRecommender.pick(12)
+        val picks=randomRecommender.pick(4)
         if(picks.isNotEmpty()) { showRandomDialog(picks); return }
         // 池空或近期都展示过：先补充再展示
         showRandomDialog(emptyList(), loading = true)
         replenishRandomPool {
-            val next=randomRecommender.pick(12)
+            val next=randomRecommender.pick(4)
             if(next.isNotEmpty()) showRandomDialog(next) else randomDialog?.dismiss().also { Toast.makeText(this,"暂时无法随机荐剧，请稍后重试",Toast.LENGTH_SHORT).show() }
         }
     }
@@ -2714,21 +3012,22 @@ class MainActivity: Activity() {
         val title=TvDialog.title(this,if(loading) "正在随机挑选…" else "随机荐剧")
         body.addView(title)
         val content=FrameLayout(this)
-        // 内容区高度按屏幕算：固定 420dp 在 1080p / 高密度面板上会连标题和按钮一起顶出屏幕
-        // （实测模拟器直接超屏）。留出标题、按钮行与卡片内边距，最多 420dp。
-        val contentHeight=minOf(dp(420),resources.displayMetrics.heightPixels-dp(230)).coerceAtLeast(dp(200))
+        // 内容区高度按屏幕算：一次只出 4 部（2×2 两行），高度按两行卡片实测算，
+        // 小屏仍以「屏幕高-230dp」兜底，最低 200dp。
+        val cardWidth=dp(132)
+        val posterHeight=(cardWidth/TvStyle.POSTER_ASPECT).toInt()
+        val contentHeight=minOf(posterHeight*2+dp(178),resources.displayMetrics.heightPixels-dp(230)).coerceAtLeast(dp(200))
         body.addView(content,lp(-1,contentHeight).apply { bottomMargin=dp(10) })
         val dlg=AlertDialog.Builder(this).setView(TvDialog.card(this,body)).create()
-        // 海报网格 4 列异步填充，宽度必须固定，不能收缩到内容
-        TvDialog.styleWindow(this,dlg,widthDp=520)
+        // 海报网格 2 列异步填充，宽度必须固定，不能收缩到内容：
+        // 2×132 卡片 + 8 间距 + 卡片左右内边距 56 ≈ 330dp
+        TvDialog.styleWindow(this,dlg,widthDp=330)
         randomDialog=dlg
         dlg.show()
         if(items.isEmpty() && !loading) {
             content.addView(text("候选池为空，正在补充…",15f,muted).apply { setPadding(0,dp(20),0,0) })
         } else if(items.isNotEmpty()) {
-            // 弹窗专用固定尺寸卡片：宽104dp，上图（3:4固定高）下名称+集数，小图拉伸撑满
-            val cardWidth=dp(104)
-            val posterHeight=(cardWidth/TvStyle.POSTER_ASPECT).toInt()
+            // 弹窗专用固定尺寸卡片：宽132dp，上图（3:4固定高）下名称+集数，小图拉伸撑满
             val randomAdapter=object: RecyclerView.Adapter<RecyclerView.ViewHolder>() {
                 override fun getItemCount()=items.size
                 override fun onCreateViewHolder(parent: ViewGroup,viewType: Int): RecyclerView.ViewHolder {
@@ -2753,18 +3052,18 @@ class MainActivity: Activity() {
                     card.setOnFocusChangeListener { _,focused -> card.background=TvStyle.card(this@MainActivity,focused); if(focused) loadCover(image,item.cover) }
                 }
             }
-            val grid=GridLayoutManager(this,4)
+            val grid=GridLayoutManager(this,2)
             val recycler=RecyclerView(this).apply { clipToPadding=false; itemAnimator=null }
             recycler.layoutManager=grid; recycler.adapter=randomAdapter
             content.addView(recycler,lp(-1,-1))
         }
-        // 「换一批」按钮
-        val buttons=row().apply { gravity=Gravity.END; setPadding(0,dp(14),0,0) }
+        // 「换一批」按钮（居中）
+        val buttons=row().apply { gravity=Gravity.CENTER; setPadding(0,dp(14),0,0) }
         val change=TvDialog.capsuleButton(this,"换一批") {
             dlg.dismiss()
-            val picks=randomRecommender.pick(12)
+            val picks=randomRecommender.pick(4)
             if(picks.isNotEmpty()) showRandomDialog(picks)
-            else { showRandomDialog(emptyList(), loading = true); replenishRandomPool { val n=randomRecommender.pick(12); if(n.isNotEmpty()) showRandomDialog(n) } }
+            else { showRandomDialog(emptyList(), loading = true); replenishRandomPool { val n=randomRecommender.pick(4); if(n.isNotEmpty()) showRandomDialog(n) } }
         }
         val close=TvDialog.capsuleButton(this,"关闭") { dlg.dismiss() }
         buttons.addView(change,lp(-2,-2).apply { rightMargin=dp(12) })
@@ -3160,6 +3459,7 @@ class MainActivity: Activity() {
             root.addView(ScrollView(this).apply { isVerticalScrollBarEnabled=false; addView(hud) },FrameLayout.LayoutParams(-1,-2,Gravity.BOTTOM))
         }
         applyClock()
+        applyNetSpeedOverlay()
         playbackTitle.text="${data.series.title}  ·  第 ${episodeIndex+1} 集"
         playbackText.text="正在获取播放地址…"; progressBar.progress=0; progressBar.visibility=View.VISIBLE; hidePlaybackOverlay()
         controls.removeAllViews(); controls.visibility=View.GONE; recoverySpinner?.visibility=View.GONE; transportPlay=null; sleepButton=null
@@ -3209,7 +3509,14 @@ class MainActivity: Activity() {
                         if(sleepTimer.episodeEnded()) stopForSleep()
                         else if(foreground && requestedAutoplay && !pausedForLifecycle && library.autoNext && episodeIndex<data.episodes.lastIndex) playEpisode(episodeIndex+1,savedPosition(episodeIndex+1))
                         else if(foreground && requestedAutoplay && !pausedForLifecycle && continueToNextSeason()) { /* season jump in progress */ }
-                        else { requestedAutoplay=false; p.pause(); showEndedPanel() }
+                        else {
+                            requestedAutoplay=false; p.pause()
+                            // 最后一集自然播完且没跳成下一季：自动打「整剧已看完」标记。
+                            // 首页「接着看」与手机端继续观看本就过滤 watched；历史记录保留，
+                            // 在「我的 - 观看历史」里仍能看到，徽标显示「整剧已看完」。
+                            if(WatchCompletion.finished(episodeIndex,data.episodes.size)) markSeriesWatched(data.series)
+                            showEndedPanel()
+                        }
                     }
                 }
                 /** 播放器自动切到预挂的下一集：原地交接状态，不再 stop/clearMediaItems，避免重新解析片头与重建解码器。 */
@@ -3616,8 +3923,16 @@ class MainActivity: Activity() {
     private fun skipEpisode(direction: Int): Boolean {
         if(!foreground || screen!="player") return false
         val count=detail?.episodes?.size ?: return false
+        if(count<=0) return false
         val target=episodeIndex+direction
-        if(target !in 0 until count) return false
+        // 上下键换集、媒体键、手势、语音/遥控 play.next 都走这里；到头了必须给反馈，
+        // 否则用户只看到「按了没反应」。方向对称，第一集往上同样提示。
+        if(target !in 0 until count) {
+            Toast.makeText(this,
+                if(direction>0) "已经是最后一集了 · 播完会自动标记已看完" else "已经是第一集了",
+                Toast.LENGTH_SHORT).show()
+            return false
+        }
         playEpisode(target,savedPosition(target)); showHud(); return true
     }
     private fun syncMediaSession() {
@@ -4069,10 +4384,19 @@ class MainActivity: Activity() {
         openDetail(next,resume=true,autoplay=true)
         return true
     }
+    /** 整剧播完自动标记：不重复提示，也不删历史——「我的 - 观看历史」要留着这一条。 */
+    private fun markSeriesWatched(series: Series) {
+        if(library.watched(series.id)) return
+        library.setWatched(series.id,true)
+        Toast.makeText(this,"《${series.title}》已看完 · 已移出「接着看」，可在「我的 - 观看历史」查看",Toast.LENGTH_LONG).show()
+    }
     private fun showEndedPanel() {
         val data=detail
         if(playError || data==null || !library.autoNext || !library.autoSeason || episodeIndex<data.episodes.lastIndex) {
-            playbackText.text="本集已结束"; showPanel(); return
+            // 最后一集播完但没开自动连播/跨季时，也要明确告诉用户「整部剧看完了」
+            playbackText.text=if(!playError && data!=null && WatchCompletion.finished(episodeIndex,data.episodes.size))
+                "全剧已播完 · 已标记看完" else "本集已结束"
+            showPanel(); return
         }
         val cached=library.cachedHome(library.contentType)?.items.orEmpty().filter { it.id!=data.series.id }
         if(cached.isNotEmpty()) { showRecommendationPanel(cached); return }
@@ -4507,7 +4831,10 @@ class MainActivity: Activity() {
         if(address==null) { main.postDelayed({ if(!isDestroyed) autoStartRemote() }, 3000); return }
         runCatching {
             PhoneRemoteSession(this,address,{ remoteTarget() },remoteController,{ remoteResumeList() },{ remoteResumeAll() },
-                cover={ artwork.bytes(it) },onClients={ syncRemoteEntry() }) {
+                cover={ artwork.bytes(it) },
+                upload={ name,length,stream -> tvTools.receiveRemoteUpload(name,length,stream) },
+                batchUpload={ items,stream -> tvTools.receiveRemoteBatchUpload(items,stream) },
+                onClients={ syncRemoteEntry() }) {
                 remote=null; syncRemoteEntry()
             }.also { session -> remote=session; remoteStartTries=0 }
         }.onFailure { android.util.Log.w("HongguoTV","autoStartRemote failed: ${it.message}") }
@@ -4674,7 +5001,9 @@ class MainActivity: Activity() {
                 it.episodeLabel.ifBlank { "第 ${it.episodeIndex+1} 集" }+" · "+formatTime(it.positionMs),
                 it.positionMs,it.durationMs,it.cover)
         }
-        return library.history().filter { it.duration>0 && !it.completed }.take(8).map {
+        // watched = 整剧已看完（末集播完自动标，或长按手动标）：继续观看不该再翻出来，
+        // 只在电视「我的 - 观看历史」里留着
+        return library.history().filter { it.duration>0 && !it.completed && !library.watched(it.series.id) }.take(8).map {
             ResumeItem(it.series.id,it.series.title,"第 ${it.episodeIndex+1} 集 · ${formatTime(it.position)}",it.position,it.duration,it.series.cover)
         }
     }
@@ -4686,14 +5015,15 @@ class MainActivity: Activity() {
                 it.episodeLabel.ifBlank { "第 ${it.episodeIndex+1} 集" }+" · "+formatTime(it.positionMs),
                 it.positionMs,it.durationMs,it.cover)
         }
-        val local=library.history().filter { it.duration>0 && !it.completed }
+        val local=library.history().filter { it.duration>0 && !it.completed && !library.watched(it.series.id) }
         val localIds=local.map { it.series.id }.toSet()
         val cloud=if(!accountManager.signedIn) emptyList() else {
             // 云端历史没拉过就顺手踢一次（异步、只踢一次），下次打开「更多」就有
             if(!accountManager.cloudHistoryLoaded && !remoteCloudKicked) {
                 remoteCloudKicked=true; accountManager.refreshHistory()
             }
-            accountManager.cloudRows().filter { it.series.id !in localIds }
+            // 本机已标看完的剧，别让云端记录又把它补回「继续观看」
+            accountManager.cloudRows().filter { it.series.id !in localIds && !library.watched(it.series.id) }
         }
         return local.map {
             ResumeItem(it.series.id,it.series.title,"第 ${it.episodeIndex+1} 集 · ${formatTime(it.position)}",it.position,it.duration,it.series.cover)
@@ -4728,6 +5058,148 @@ class MainActivity: Activity() {
      * 手机扫码窗口一旦有手机连上就会自动关掉，想抄地址去配自动化就没地方看；
      * 这里固定展示一次，并列出外部可直接用的命令，省得去翻源码或抓包。
      */
+    private fun proxyLabel()="网络代理  ·  ${AppProxy.current().display}"
+
+    /**
+     * 代理帮助：用户大多不熟悉 Clash 的局域网代理配置，把文档要点浓缩成三段——
+     * 电脑端怎么开、电视端怎么填、连不上时按什么顺序排查。在设置对话框点「帮助」弹出。
+     */
+    private fun proxyHelpText()="""
+        什么时候需要开：部分片源域名被运营商上游 DNS 污染或 SNI 阻断（换 DNS、DoH 均无效），开启代理后全部网络流量走局域网代理即可恢复访问。快传 / 遥控 / WebDAV 等局域网功能始终直连，不受影响。
+
+        一、电脑端准备（以 Clash / mihomo 为例）
+        1. 打开「允许局域网连接 / Allow LAN」
+        2. 记下代理端口（Clash 默认混合端口 7890，其他软件以实际为准）
+        3. Windows 防火墙首次弹窗选「允许访问」；电视一直连不上时，在防火墙高级设置里给代理软件加一条入站规则
+        4. 查电脑 IP：命令行运行 ipconfig，看 IPv4 地址（192.168.x.x）
+
+        二、电视端填写
+        1. 填电脑 IP 和端口；遥控输入不便就点「扫码填写」，用手机回填
+        2. 点「测试连接」，提示连通成功后「启用并保存」
+        3. 不想用了回来点「停用」即可
+
+        三、常见问题
+        · 测试连接失败：按顺序排查——电脑代理已启动、端口与这里填的一致、电视和电脑在同一网络、防火墙已放行
+        · 用 FlClash：软件里的代理开关必须打开，否则核心会静默拒绝所有代理流量（无任何报错）
+        · 电脑改过端口：电视这里要同步改
+        · 代理正常但某源仍打不开：多半是该源域名本身失效，与代理无关
+        · 手机遥控页也能开关：对输入框说「打开网络代理」「关闭网络代理」「代理状态」
+    """.trimIndent().replace(Regex("^[ ]+",RegexOption.MULTILINE),"")
+
+    /**
+     * 网络代理设置：部分片源域名被上游 DNS 污染或 SNI 阻断（换 DNS/DoH 无效），
+     * 让全部流量走局域网 HTTP 代理是唯一应用侧出路。详见 [AppProxy]。
+     */
+    private fun showProxyDialog(anchor: View) {
+        val current=AppProxy.current()
+        val form=column().apply { setPadding(dp(8),dp(4),dp(8),dp(8)) }
+        val hostEdit=EditText(this).apply {
+            hint="代理地址，如 192.168.31.23"; textSize=15f; setTextColor(white); setHintTextColor(muted)
+            isSingleLine=true; maxLines=1
+            background=rounded(bg); setPadding(dp(10),dp(10),dp(10),dp(10))
+            setText(current.host)
+            setOnFocusChangeListener { _,focused -> background=rounded(if(focused) TvStyle.raised else bg,if(focused) accent else Color.TRANSPARENT) }
+        }
+        val portEdit=EditText(this).apply {
+            hint="端口，如 7890"; textSize=15f; setTextColor(white); setHintTextColor(muted)
+            isSingleLine=true; maxLines=1
+            inputType=android.text.InputType.TYPE_CLASS_NUMBER
+            background=rounded(bg); setPadding(dp(10),dp(10),dp(10),dp(10))
+            if(current.port>0) setText(current.port.toString())
+            setOnFocusChangeListener { _,focused -> background=rounded(if(focused) TvStyle.raised else bg,if(focused) accent else Color.TRANSPARENT) }
+        }
+        val errorText=text("",13f,accent).apply { setPadding(0,dp(6),0,0) }
+        form.addView(text("部分片源域名被运营商上游 DNS 污染或 SNI 阻断（换 DNS / DoH 均无效），开启代理后全部网络流量走局域网代理，可恢复访问。局域网地址（快传 / 遥控 / WebDAV）始终直连。",12f,muted).apply { setPadding(0,0,0,dp(10)) })
+        form.addView(text("代理地址",13f,muted)); form.addView(hostEdit)
+        form.addView(text("端口",13f,muted).apply { setPadding(0,dp(8),0,0) }); form.addView(portEdit)
+        form.addView(errorText)
+        form.addView(text("电脑端以 Clash 为例：开启「允许局域网连接 Allow LAN」，这里填电脑的局域网 IP 和混合代理端口。",12f,muted).apply { setPadding(0,dp(6),0,0) })
+        val actions=row().apply { setPadding(0,dp(12),0,0) }
+        lateinit var dialog: AlertDialog
+        val enable=TvDialog.capsuleButton(this,"启用并保存",compact=true) { }
+        val test=TvDialog.capsuleButton(this,"测试连接",compact=true) { }
+        val scan=TvDialog.capsuleButton(this,"扫码填写",compact=true) { }
+        lateinit var help: Button
+        help=TvDialog.capsuleButton(this,"帮助",compact=true) { tvTools.info("网络代理 · 帮助",proxyHelpText(),help) }
+        val disable=TvDialog.capsuleButton(this,"停用",compact=true) { }
+        val cancel=TvDialog.capsuleButton(this,"取消",compact=true) { dialog.dismiss() }
+        // 六个按钮用 compact 胶囊（13sp/内边距12）一行放下；常规尺寸会裁掉末尾按钮
+        listOf(enable to 8,test to 8,scan to 8,help to 8,disable to 8,cancel to 0).forEach { (view,margin) ->
+            actions.addView(view,lp(-2,-2).apply { rightMargin=dp(margin) })
+        }
+        form.addView(actions)
+        val content=column()
+        content.addView(TvDialog.title(this,"网络代理"))
+        content.addView(ScrollView(this).apply { addView(form) },lp(-1,0).apply { weight=1f })
+        dialog=AlertDialog.Builder(this).setView(TvDialog.card(this,content)).create()
+        TvDialog.styleWindow(this,dialog)
+
+        fun readConfig(enabled: Boolean): AppProxy.Config {
+            val host=hostEdit.text.toString().trim()
+            val port=portEdit.text.toString().trim().toIntOrNull() ?: 0
+            return AppProxy.Config(enabled,host,port)
+        }
+        fun persist(cfg: AppProxy.Config) {
+            AppProxy.save(this,cfg)
+            (anchor as? TextView)?.text=proxyLabel()
+            dialog.dismiss()
+            Toast.makeText(this,if(cfg.enabled) "网络代理已启用 · ${cfg.host}:${cfg.port}" else "网络代理已停用",Toast.LENGTH_SHORT).show()
+        }
+        enable.setOnClickListener {
+            val cfg=readConfig(true)
+            when {
+                cfg.host.isEmpty() -> errorText.text="请填写代理地址"
+                cfg.port !in 1..65535 -> errorText.text="端口需为 1-65535 的数字"
+                else -> persist(cfg)
+            }
+        }
+        disable.setOnClickListener { persist(readConfig(false)) }
+        test.setOnClickListener {
+            val cfg=readConfig(true)
+            if(cfg.host.isEmpty() || cfg.port !in 1..65535) { errorText.text="请先填写有效的地址与端口"; return@setOnClickListener }
+            errorText.text="测试中…"; test.isFocusable=false; test.isEnabled=false
+            io.execute {
+                val started=System.currentTimeMillis()
+                val result=runCatching {
+                    val proxy=java.net.Proxy(java.net.Proxy.Type.HTTP,java.net.InetSocketAddress(cfg.host,cfg.port))
+                    val client=okhttp3.OkHttpClient.Builder()
+                        .proxy(proxy)
+                        .connectTimeout(5,java.util.concurrent.TimeUnit.SECONDS)
+                        .readTimeout(5,java.util.concurrent.TimeUnit.SECONDS)
+                        .build()
+                    // 显式 .proxy() 绕开全局 selector，确保测的就是用户填的那个代理
+                    client.newCall(okhttp3.Request.Builder().url("https://www.baidu.com/").head().build()).execute().use { it.code }
+                }
+                main.post {
+                    test.isFocusable=true; test.isEnabled=true
+                    result.onSuccess { code -> errorText.text="连通成功 · ${System.currentTimeMillis()-started} ms（HTTP $code）" }
+                        .onFailure { errorText.text="连接失败：${it.message?.take(80) ?: "未知错误"}" }
+                }
+            }
+        }
+        scan.setOnClickListener {
+            // 电视键盘输入 IP/端口太费劲，走手机表单回填（与片源导入同一通道）
+            tvTools.phoneForm(enable,PhoneForm(
+                heading="填写网络代理",
+                description="填写局域网内代理服务的 IP 与端口（如电脑 Clash 的局域网 IP 和 7890），提交后自动回填到电视。",
+                fields=listOf(
+                    PhoneField("host","代理地址","例如：192.168.31.23",60),
+                    PhoneField("port","端口","例如：7890",5)),
+                doneHint="请回到电视点「启用并保存」。",
+                invalidMessage="请填写有效的地址与端口"
+            )) { values ->
+                val host=values["host"].orEmpty().trim()
+                val port=values["port"].orEmpty().trim()
+                if(host.isNotEmpty() && port.toIntOrNull() in 1..65535) { hostEdit.setText(host); portEdit.setText(port); enable.requestFocus() }
+                else errorText.text="请填写有效的地址与端口"
+            }
+        }
+        dialog.show()
+        // 与片源导入对话框同一规则：不自动聚焦输入框，避免弹软键盘挡住操作按钮
+        dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
+        enable.requestFocus()
+    }
+
     private fun showRemoteAddress(anchor: View) {
         autoStartRemote()
         val session=remote ?: run {
@@ -4757,6 +5229,7 @@ class MainActivity: Activity() {
             appendLine("剧名 / 文盲修仙第七集 / 快进30秒 / 快退一分钟 / 返回上一级")
             appendLine("1.5倍速 / 静音 / 声音大一点 / 半小时后关掉")
             appendLine("随机推荐一部漫剧 / 切换短剧 / 登录红果账户 / 检查更新")
+            appendLine("打开网络代理 / 关闭网络代理 / 代理状态")
             appendLine()
             append("module 可选：home / search / rank / favorite / history / settings / source / library")
         }
@@ -4812,12 +5285,38 @@ class MainActivity: Activity() {
                 voiceSay(if(library.showClock) "已显示系统时间" else "已隐藏系统时间")
                 true
             }
+            "netspeed.toggle" -> {
+                library.netSpeed=!library.netSpeed
+                // 所有界面常显（含播放页），挂在 root 上随页面重建自动恢复
+                applyNetSpeedOverlay(show=library.netSpeed)
+                voiceSay(if(library.netSpeed) "网速显示已打开" else "网速显示已关闭")
+                true
+            }
+            // 显式开 / 关：说「打开网速」时本来开着，就该保持开着，而不是被切成关
+            "netspeed.set" -> {
+                val on=cmd.arg=="on"
+                if(library.netSpeed==on) { voiceSay(if(on) "网速显示本来就是开着的" else "网速显示本来就是关着的"); return true }
+                library.netSpeed=on
+                applyNetSpeedOverlay(show=on)
+                voiceSay(if(on) "网速显示已打开" else "网速显示已关闭")
+                true
+            }
             "backdrop.reset" -> {
                 resetBackdrop("plain")
                 refreshBackdropSetting?.invoke()
                 voiceSay("已恢复默认背景")
                 true
             }
+            // 预览浮层里的「设为电视背景」按钮，语音一句话直接对最近一张快传图片生效
+            "backdrop.set" -> {
+                tvTools.recentQuickFile(TransferKind.IMAGE) { hit ->
+                    if(hit==null) voiceSay("还没有快传图片，先用手机快传传一张")
+                    else { setQuickBackdrop(hit.file); voiceSay("已把 ${hit.name} 设为电视背景") }
+                }
+                true
+            }
+            // 上传整批接收 / 安装 APK / 设为背景这类确认框：没有确认按钮时不执行
+            "dialog.confirm" -> if(TvDialog.confirmTopmost()) { voiceSay("已确认"); true } else false
             // 只关弹窗，不代替「返回」：没有弹窗时什么都不做，免得一句话把人从当前页退走。
             "dialog.close" -> {
                 val dialog=TvDialog.topmostDialog() ?: return false
@@ -4877,7 +5376,12 @@ class MainActivity: Activity() {
             }
             "speed.up" -> adjustSpeed(1)
             "speed.down" -> adjustSpeed(-1)
-            "sleep.set" -> sleepTarget(cmd.arg)?.let { (kind,value) ->
+            "sleep.set" -> if(cmd.arg=="off") {
+                sleepTimer.cancel()
+                voiceSay("已取消定时停止")
+                updatePlaybackText()
+                true
+            } else sleepTarget(cmd.arg)?.let { (kind,value) ->
                 // 界面上的定时只有 1..180 分钟 / 1..10 集，越界会被 SleepTimer 直接拒掉
                 if(kind=="min") sleepTimer.afterMinutes(value.coerceIn(1,180))
                 else sleepTimer.afterEpisodes(value.coerceIn(1,10))
@@ -4885,6 +5389,8 @@ class MainActivity: Activity() {
                 updatePlaybackText()
                 true
             } ?: false
+            // 播放快捷面板：清晰度/倍速/弹幕/更多四列，只在播放页有意义
+            "panel.quick" -> if(screen=="player") { showQuickPanel(); voiceSay("播放快捷面板"); true } else false
             "volume.up" -> adjustVolume(1)
             "volume.down" -> adjustVolume(-1)
             "volume.mute" -> adjustMute(cmd.arg)
@@ -4905,6 +5411,8 @@ class MainActivity: Activity() {
                 if(added) favoriteMonitor.check()
                 true
             }
+            // 主动查一次收藏更新：有新集时收藏页角标会亮，语音查完去收藏页就能看到
+            "favorite.check" -> { favoriteMonitor.check(); if(accountManager.signedIn) accountManager.refreshFavorites(); voiceSay("正在检查收藏更新"); true }
             "update.check" -> { updater.checkNow(anchor); true }
             "check.interface" -> { showInterfaceCheck(anchor); true }
             "cache.clear" -> {
@@ -4929,6 +5437,14 @@ class MainActivity: Activity() {
                 true
             }
             "transfer.files" -> { openQuickFiles(anchor); true }
+            // 全屏预览 / 播放最近收到的文件，与在「快传文件」列表里点一行完全同一条路径
+            "transfer.preview" -> {
+                tvTools.recentQuickFile(null) { hit ->
+                    if(hit==null) voiceSay("还没有快传文件")
+                    else { voiceSay("正在打开 ${hit.name}"); handleQuickTransfer(hit.file,hit.kind,true,anchor) }
+                }
+                true
+            }
             "transfer.clear" -> {
                 tvTools.clearQuickFiles { count,bytes ->
                     voiceSay(if(count<=0) "快传文件本来就是空的"
@@ -4951,6 +5467,25 @@ class MainActivity: Activity() {
             "hidden.restore" -> {
                 library.unhideAll()
                 voiceSay("已恢复隐藏推荐")
+                true
+            }
+            // 网络代理开关：arg = on | off（空=切换）。语音说「开代理」最常见的就是
+            // 被拦截的片源打不开时；地址没配过开不了，提示去设置里配，不静默失败。
+            "proxy.set", "proxy.status" -> {
+                val cur=AppProxy.current()
+                if(cmd.id=="proxy.status") {
+                    voiceSay(when {
+                        !cur.enabled -> "网络代理未启用"
+                        cur.valid -> "网络代理已启用 · ${cur.host}:${cur.port}"
+                        else -> "网络代理配置不完整"
+                    })
+                    return true
+                }
+                val target=when(cmd.arg) { "on" -> true; "off" -> false; else -> !cur.enabled }
+                if(target==cur.enabled) { voiceSay(if(target) "代理本来就是开着的" else "代理本来就是关着的"); return true }
+                if(target && !cur.valid) { voiceSay("还没配置代理地址，先到设置里填一次"); return true }
+                AppProxy.save(this,cur.copy(enabled=target))
+                voiceSay(if(target) "网络代理已开启 · ${cur.host}:${cur.port}" else "网络代理已关闭")
                 true
             }
             else -> false
@@ -5122,8 +5657,9 @@ class MainActivity: Activity() {
             resetPlaybackSession(); sleepTimer.cancel(); sleepStopped=false
             saveProgress(); library.flush(); releasePlayer()
         }
-        if(tab!=target) switchTab(target) else showCatalog()
-        nav.getOrNull(target)?.requestFocus()
+        if(tab!=target) switchTab(target) else showCatalog(focusSegment=(target==3||target==4))
+        // 我的模块（最近观看/收藏）焦点由 focusSegment 落分段按钮，不强推顶栏
+        if(!(target==3||target==4)) nav.getOrNull(target)?.requestFocus()
         return true
     }
 

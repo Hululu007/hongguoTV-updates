@@ -14,7 +14,7 @@ android {
         minSdk = findProperty("HONGGUOTV_MIN_SDK")?.toString()?.toInt() ?: 26
         targetSdk = 36
         versionCode = System.getenv("HONGGUOTV_VERSION_CODE")?.toInt() ?: 12
-        versionName = System.getenv("HONGGUOTV_VERSION_NAME") ?: "0.30.10"
+        versionName = System.getenv("HONGGUOTV_VERSION_NAME") ?: "0.31.0"
     }
     buildFeatures { buildConfig = true }
     signingConfigs {
@@ -45,4 +45,6 @@ dependencies {
     // 本地单测：CMS 解析跑在 JVM，需要真实 org.json 实现（Android 平台 stub 未 mock）
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+    // CMS v1 XML 解析用 XmlPullParserFactory，JVM 测试需要实现库（Android 自带 kxml 实现）
+    testImplementation("net.sf.kxml:kxml2:2.3.0")
 }

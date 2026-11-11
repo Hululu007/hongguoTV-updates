@@ -97,12 +97,20 @@ class AccountManager(private val context: Context, private val library: Library)
             .build()
     private val client = CloudAccountClient(http)
     private val store = AccountStore(context)
+    /** 换季嫌疑剧的详情补查：只对集数回退的收藏逐部拉详情确认 newerSeasons，1.5 秒一部的节奏。 */
+    private val seasonRepository = ContentRepository(http)
+    private val seasonScope = RequestScope()
+    private val checkWorker = Executors.newSingleThreadExecutor { task -> Thread(task, "hongguotv-cloud-check") }
+    private val seasonChecks = ArrayDeque<Pair<String, Int>>()
+    @Volatile private var seasonChecking = false
     @Volatile private var generation = 0
     @Volatile private var closed = false
     private var credentials: AccountCredentials? = null
     private var profile: CloudProfile? = null
     private var cloudHistory = emptyList<CloudProgress>()
     private var historyLoaded = false
+    private var cloudFavorites = emptyList<CloudFavorite>()
+    private var favoritesLoaded = false
     private var status = "未登录"
     private var busy = false
     var onAccountChanged: (() -> Unit)? = null
@@ -160,6 +168,7 @@ class AccountManager(private val context: Context, private val library: Library)
                         status = "已登录，正在读取云端历史…"
                         changed()
                         refreshHistory()
+                        refreshFavorites()
                     }
                     .onFailure { error ->
                         Log.w("HongguoTV", "Account validation failed", error)
@@ -205,6 +214,135 @@ class AccountManager(private val context: Context, private val library: Library)
 
     /** 云端观看记录（只读）：按更新时间倒序，只保留有播放进度的。 */
     fun cloudRows(): List<CloudProgress> = cloudHistory.filter { it.position > 0 }
+
+    /** 云端收藏（只读展示）：按收藏时间倒序。 */
+    fun cloudFavoriteRows(): List<CloudFavorite> = cloudFavorites
+
+    /** 云端收藏是否已成功拉取过；收藏页构建时用它判断要不要顺手触发一次 refreshFavorites。 */
+    val cloudFavoritesLoaded get() = favoritesLoaded
+
+    /** 拉取云端收藏，仅作只读展示：不合并不回写本机收藏。 */
+    fun refreshFavorites(onDone: (() -> Unit)? = null) {
+        val account = credentials ?: run { onDone?.invoke(); return }
+        if (closed) { onDone?.invoke(); return }
+        val token = generation
+        status = "正在读取云端收藏…"
+        changed()
+        worker.execute {
+            if (closed || token != generation) { main.post { onDone?.invoke() }; return@execute }
+            val result = runCatching { client.favorites(account) }
+            main.post {
+                if (closed || token != generation) { onDone?.invoke(); return@post }
+                result
+                    .onSuccess { rows ->
+                        cloudFavorites = rows
+                        favoritesLoaded = true
+                        val suspects = reconcileCloudFavorites(rows)
+                        val updates = library.updatedCloudFavorites() + library.cloudNewCount()
+                        status = "已读取 ${cloudFavorites.size} 部云端收藏" + if (updates > 0) "，$updates 部有更新" else ""
+                        changed()
+                        scheduleSeasonChecks(suspects)
+                    }
+                    .onFailure { error ->
+                        status = "云端收藏读取失败：${safeError(error)}"
+                        changed()
+                    }
+                onDone?.invoke()
+            }
+        }
+    }
+
+    /**
+     * 云端收藏上新对账：书架响应自带每剧当前集数，与本地基线 diff 即可，0 额外请求。
+     * 集数变大 → 「已更新 N 集」；书架新条目 → 「新收藏」；集数回退（疑似换季重置）
+     * 不直接计加更，返回给调用方补查详情确认新季。基线只存本机，不进备份。
+     */
+    private fun reconcileCloudFavorites(rows: List<CloudFavorite>): List<Pair<String, Int>> {
+        if (!library.isLoaded) return emptyList()
+        val now = System.currentTimeMillis()
+        val suspects = mutableListOf<Pair<String, Int>>()
+        // 首次建立基线时全部静默：之后书架新出现的条目才值得标「新收藏」
+        val baselineExisted = library.cloudBaselineCount() > 0
+        for (row in rows) {
+            val count = CloudAccountClient.episodeTotal(row.series.badge)
+            if (count <= 0) continue
+            val known = library.cloudUpdate(row.series.id)
+            if (known != null && count < known.total) { suspects += row.series.id to count; continue }
+            library.observeCloudFavorite(row.series.id, count, now, markNew = baselineExisted && known == null)
+        }
+        library.pruneCloudFavorites(rows.mapTo(HashSet()) { it.series.id })
+        return suspects
+    }
+
+    /** 换季嫌疑逐部补查详情：查到 newerSeasons 才挂「第 X 季已上线」，查不到就静默换基线。 */
+    private fun scheduleSeasonChecks(suspects: List<Pair<String, Int>>) {
+        if (suspects.isEmpty() || closed) return
+        seasonChecks.addAll(suspects)
+        if (!seasonChecking) processSeasonChecks()
+    }
+
+    private fun processSeasonChecks() {
+        val next = seasonChecks.removeFirstOrNull()
+        if (next == null || closed) { seasonChecking = false; return }
+        seasonChecking = true
+        val token = generation
+        checkWorker.execute {
+            val result = runCatching { seasonScope.run { seasonRepository.detail(next.first) } }
+            main.post {
+                if (closed || token != generation) { seasonChecking = false; return@post }
+                result.onSuccess { detail ->
+                    val season = detail.newerSeasons.lastOrNull()
+                    library.observeCloudFavorite(next.first, next.second, System.currentTimeMillis(), newSeason = season)
+                    changed()
+                }
+                main.postDelayed({ processSeasonChecks() }, 1_500L)
+            }
+        }
+    }
+
+    /**
+     * 手动把本机收藏同步到云端：把云端没有的本机收藏逐部加入视频书架。
+     * 上游协议要求写完书架后回读确认，回读结果直接作为新的云端缓存；
+     * 全程不写本机收藏，回调 onDone(上传, 跳过, 失败)。
+     */
+    fun syncFavoritesToCloud(onDone: (pushed: Int, skipped: Int, failed: Int) -> Unit) {
+        val account = credentials ?: run { toast("未登录"); return }
+        if (closed || busy) { toast("账号操作进行中，请稍候"); return }
+        if (!signedIn) { toast("请先登录红果账号"); return }
+        if (!library.isLoaded) { toast("收藏还在加载，请稍候再试"); return }
+        busy = true
+        status = "正在把本机收藏同步到云端…"
+        // 手动同步期间不触发 onAccountChanged，避免 showCatalog 重建页面打断按钮
+        val token = generation
+        worker.execute {
+            val localRows = library.favorites()
+            val cloudIds = cloudFavorites.mapTo(HashSet()) { it.series.id }
+            var pushed = 0
+            var skipped = 0
+            var failed = 0
+            for (series in localRows) {
+                if (closed || token != generation) return@execute
+                // 书架只收官方剧集编号；三方源或其他形态的收藏跳过不计
+                if (!series.id.matches(Regex("[0-9]{1,30}"))) { skipped++; continue }
+                if (series.id in cloudIds) { skipped++; continue }
+                val ok = runCatching { client.setFavorite(account, series.id, true) }.isSuccess
+                if (ok) pushed++ else failed++
+            }
+            val reread = if (pushed > 0 && !closed && token == generation) runCatching { client.favorites(account) } else null
+            main.post {
+                if (closed || token != generation) return@post
+                busy = false
+                reread?.onSuccess { rows ->
+                    cloudFavorites = rows
+                    favoritesLoaded = true
+                    reconcileCloudFavorites(rows)
+                }
+                status = if (failed > 0) "收藏同步完成：上传 $pushed 部，失败 $failed 部"
+                else "收藏同步完成：上传 $pushed 部，跳过 $skipped 部"
+                onDone(pushed, skipped, failed)
+            }
+        }
+    }
 
     /**
      * 手动同步本机记录到云端：逐部上传本机进度。
@@ -287,14 +425,16 @@ class AccountManager(private val context: Context, private val library: Library)
             toast("账号操作进行中，请稍候")
             return
         }
-        val choices = if (signedIn) listOf("刷新云端记录", "同步本机到云端", "退出红果账号") else listOf("扫码登录")
+        val choices =
+            if (signedIn) listOf("刷新云端记录", "同步本机到云端", "退出红果账号")
+            else listOf("扫码登录", "手机号验证码登录")
         TvDialog.choose(
             activity,
             profile?.let { "红果账号 · ${it.nickname}" } ?: "红果账号",
             choices,
             onChoice = { index ->
                 if (!signedIn) {
-                    qrLogin(activity)
+                    if (index == 0) qrLogin(activity) else phoneLogin(activity)
                 } else when (index) {
                     0 -> refreshHistory()
                     1 -> syncLocalToCloud { pushed, skipped, failed ->
@@ -462,6 +602,98 @@ class AccountManager(private val context: Context, private val library: Library)
         )
     }
 
+    // ------------------------------------------------------------- 手机号登录
+
+    /**
+     * 手机号 + 验证码登录：发码 → 填码 → 换会话 → 拉资料。
+     * 走官方 App 的 passport 短信通道（网页发码被滑块挡死）；滑块要求出现时引导回扫码。
+     */
+    private fun phoneLogin(activity: android.app.Activity) {
+        phoneField(activity, "手机号登录", "填完点「发送验证码」\n大陆直接填 11 位；境外用 +区号 号码（如 +886 0912345678）", null, numeric = false) { raw ->
+            val login = PhoneLogin(http)
+            task(
+                { login.send(raw) },
+                { sent -> phoneCode(activity, login, sent.maskedMobile) },
+                { failure -> phoneFailed(activity, failure) },
+            )
+        }
+    }
+
+    private fun phoneCode(activity: android.app.Activity, login: PhoneLogin, masked: String, error: String? = null) {
+        phoneField(activity, "输入验证码", "验证码已发送至 $masked", error, numeric = true) { code ->
+            task(
+                {
+                    val next = login.verify(code)
+                    val account = client.profile(next)
+                    store.save(next)
+                    next to account
+                },
+                { (next, account) -> acceptAccount(next, account) },
+                { failure ->
+                    if (failure is PhoneLogin.Failure && failure.canRetryCode) {
+                        phoneCode(activity, login, masked, safeError(failure))
+                    } else {
+                        phoneFailed(activity, failure)
+                    }
+                },
+            )
+        }
+    }
+
+    private fun phoneFailed(activity: android.app.Activity, failure: Throwable) {
+        val retry = if (failure is PhoneLogin.Failure && failure.needsWebsite) "改用扫码" else "重新填写"
+        actionDialog(activity, "手机号登录未完成", safeError(failure), retry, onAction = { showLoginDialog(activity) })
+    }
+
+    /** 单行输入弹窗：确认后回调 [submit]，空值不回调。[error] 非空时以醒目方式附在说明后。 */
+    private fun phoneField(
+        activity: android.app.Activity,
+        title: String,
+        message: String,
+        error: String?,
+        numeric: Boolean,
+        submit: (String) -> Unit,
+    ) {
+        val dp = { v: Int -> (v * activity.resources.displayMetrics.density).toInt() }
+        val field = android.widget.EditText(activity).apply {
+            isSingleLine = true
+            inputType =
+                if (numeric) android.text.InputType.TYPE_CLASS_NUMBER
+                else android.text.InputType.TYPE_CLASS_PHONE
+            hint = if (numeric) "6 位数字" else "13800138000 或 +区号 号码"
+            textSize = 16f
+            setTextColor(TvStyle.text)
+            setHintTextColor(TvStyle.muted)
+        }
+        val content = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            addView(TvDialog.title(activity, title))
+            addView(TvDialog.body(activity, if (error == null) message else "$message\n\n$error"))
+            addView(field, android.widget.LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        }
+        val buttons = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.END
+            setPadding(0, dp(14), 0, 0)
+        }
+        val dialog = android.app.AlertDialog.Builder(activity)
+            .setView(TvDialog.card(activity, content))
+            .create()
+        val cancel = TvDialog.capsuleButton(activity, "返回") { dialog.dismiss(); showLoginDialog(activity) }
+        buttons.addView(cancel, android.widget.LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(12) })
+        val go = TvDialog.capsuleButton(activity, if (numeric) "登录" else "发送验证码") {}
+        buttons.addView(go)
+        content.addView(buttons)
+        TvDialog.styleWindow(activity, dialog) { field.requestFocus() }
+        go.setOnClickListener {
+            val value = field.text.toString().trim()
+            if (value.isEmpty()) return@setOnClickListener
+            dialog.dismiss()
+            submit(value)
+        }
+        dialog.show()
+    }
+
     private fun validateAccount(web: AccountCredentials): Pair<AccountCredentials, CloudProfile> {
         val device = client.registerDevice() ?: throw java.io.IOException("账号设备初始化失败")
         val next = web.copy(deviceId = device.deviceId, installId = device.installId)
@@ -474,11 +706,14 @@ class AccountManager(private val context: Context, private val library: Library)
         profile = account
         cloudHistory = emptyList()
         historyLoaded = false
+        cloudFavorites = emptyList()
+        favoritesLoaded = false
         generation++
         status = "已登录，正在读取云端历史…"
         changed()
         toast("已登录 ${account.nickname}")
         refreshHistory()
+        refreshFavorites()
     }
 
     private fun logout() {
@@ -488,6 +723,8 @@ class AccountManager(private val context: Context, private val library: Library)
         profile = null
         cloudHistory = emptyList()
         historyLoaded = false
+        cloudFavorites = emptyList()
+        favoritesLoaded = false
         http.dispatcher.cancelAll()
         status = "已退出账号"
         changed()
@@ -554,6 +791,7 @@ class AccountManager(private val context: Context, private val library: Library)
         onAccountChanged = null
         closed = true
         generation++
+        seasonChecks.clear()
         http.dispatcher.cancelAll()
         worker.execute {
             http.connectionPool.evictAll()
