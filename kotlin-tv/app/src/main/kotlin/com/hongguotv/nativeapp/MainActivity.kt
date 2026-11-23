@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.graphics.Color
 import android.graphics.Typeface
@@ -19,6 +20,7 @@ import android.graphics.LinearGradient
 import android.graphics.RadialGradient
 import android.graphics.ImageDecoder
 import android.graphics.SurfaceTexture
+import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.AnimatedImageDrawable
 import android.media.MediaPlayer
@@ -42,9 +44,12 @@ import androidx.recyclerview.widget.RecyclerView
 import androidx.media3.common.*
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.PlayerView
 import com.hongguotv.core.*
+import com.hongguotv.nativeapp.vc2.Vc2
+import com.hongguotv.nativeapp.vc2.Vc2NativeDecoder
 import java.util.Locale
 import java.util.concurrent.Executors
 import com.hongguotv.core.ThirdCms
@@ -52,6 +57,7 @@ import com.hongguotv.core.ThirdCms
 private const val TYPE_CARD=0
 private const val TYPE_FOOTER=1
 private const val TYPE_HEADER=2
+private const val TYPE_MORE=3
 private const val FOOTER_NONE=0
 private const val FOOTER_LOADING=1
 private const val FOOTER_END=2
@@ -150,8 +156,9 @@ class MainActivity: Activity() {
     private var bingeHintShown=false
     private var homeMenuFired=false
     private val homeMenuRunnable=Runnable { homeMenuFired=true; enterFreeFeed() }
-    /** 首页静默预热（每会话一次）：推荐队列 + 前两部详情与首集取址一并备好，
-     *  点「自由刷剧」/长按菜单进来基本只剩缓冲时间（用户 2026-11-18：首次进入偏慢）。 */
+    /** 首页静默预热（每会话一次）：推荐队列 + 紧邻下一部的详情与首集取址备好，
+     *  点「自由刷剧」/长按菜单进来基本只剩缓冲时间（用户 2026-11-18：首次进入偏慢）。
+     *  2026-11-23 只备第一部：停在首页也照发 2 个取址请求纯属白添风控密度。 */
     private var feedPrewarmed=false
     private val feedPrewarmRunnable=Runnable {
         if(feedPrewarmed || isDestroyed || !foreground) return@Runnable
@@ -294,10 +301,23 @@ class MainActivity: Activity() {
     private var autoRecovery=false
     /** 官方取址限流剩余毫秒（>0 表示上次失败是 PlaybackThrottledException）：等待期专用重试路径，不烧普通重试预算。 */
     private var throttledRemainingMs=0L
+    /** 上一轮限流的本地等待时长：官方风控窗口比它宣称的恢复时间更长（2026-11-21 实测：等满宣称时间
+     *  重试仍被拒且逐档加罚 10s→60s→120s→300s），连续被拒时本地等待翻倍退避；播放成功归零。 */
+    private var lastThrottleWait=0L
     /** 本次播放连续跳过的不兼容集数：成功后归零，最多自动跳 5 集。 */
     private var incompatibleSkips=0
     /** 排着队的「不兼容自动跳下一集」定时任务：用户抢先点了上一集/选集时必须撤掉。 */
     private var skipUnplayableJob: Runnable?=null
+    // ---- bytevc2 原生软解模式（同屏复用主播放页，用户 2026-11-20 拍板）----
+    // 音轨由 ExoPlayer 照常播（bytevc2 容器里音频是标准编码），进度/seek/倍速/弹幕时钟全部沿用；
+    // 视频由 NDK 解码器(libbvc2dec.so)软解后画到叠加的 SurfaceView 上，与音频时钟对齐。
+    private var vc2Active=false
+    /** 本集原生解码已经失败过：置位后不再重试 vc2，回落「暂不兼容」提示，防止无限重播循环。 */
+    private var vc2Failed=false
+    private var vc2Decoder: Vc2NativeDecoder?=null
+    private var vc2Surface: SurfaceView?=null
+    private var vc2Thread: Thread?=null
+    private var vc2Cache: java.io.File?=null
     private var startPosition=0L
     /**
      * 本次会话里每一集看到的位置，键为「剧 id:集 id」。
@@ -400,6 +420,8 @@ class MainActivity: Activity() {
     private var filterToggle: TextView?=null
     private var filterSummary: TextView?=null
     private var filterExpanded=true
+    /** 进入高级搜索后首次出结果自动收起面板（issue #35.2）；之后尊重用户手动展开/收起。 */
+    private var filterAutoCollapse=false
     private var filterPanel: LinearLayout?=null
     private var filterGroupsScroll: View?=null
     private var filterChips=linkedMapOf<Pair<String,String>,TextView>()
@@ -491,6 +513,8 @@ class MainActivity: Activity() {
     private var keyboardKeys=emptyMap<String,TextView>()
     private var keyboardRows=emptyList<List<TextView>>()
     private var historyFirst: TextView?=null
+    /** 最近观看页本机记录是否已展开全部：默认折叠两行+「查看全部」卡（用户 2026-11-24），切页签后回到折叠。 */
+    private var historyShowAll=false
     private var historyItems=emptyList<TextView>()
     private var suggestScrollRef: ScrollView?=null
     private var fullSearchColumns=6
@@ -548,8 +572,32 @@ class MainActivity: Activity() {
     private var playError=false
     private var lastSaved=0L
     private var quality=""
+    /** 本会话内确认整集只剩 bytevc2 的剧集 id：切清晰度/重播直接走 streamFast 融合兜底，
+     *  不再试普通直链（会 403 → 触发自动降档闪屏，最终仍回落 360p vc2，白花几秒）。 */
+    private val vc2Episodes=java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    /** 当前集的清晰度阶梯与正在用的档位（core 已按集缓存 ~1h）：播放失败自动降档沿它逐级下探，
+     *  普通档耗尽后落 bytevc2 垫底档，全程零请求。 */
+    private var activeTiers: List<StreamInfo> = emptyList()
+    private var activeTier: StreamInfo? = null
     /** 本次播放会话内的临时降档，不改用户全局设置；重进播放页或手动改清晰度时清除。 */
     private var sessionQuality: Int?=null
+    /** 剧内「已验证可播的最高档」：某档真正播到首帧 ready 就记下来，同剧后续集直接从这档起播
+     *  （用户 2026-11-21：每集优先最高分辨率，但别每集都重复撞硬解失败）。bvc2 档不记录——
+     *  全 bvc2 剧没有普通档可验证，记录会把后续集压到 bvc2 的档位上。 */
+    private val verifiedQuality=mutableMapOf<String,Int>()
+    /** 本集自动降档重放用的档位（probe）：只对当前这一集生效，换集即失效，不污染下一集起播档。 */
+    private var probeQuality: Int?=null
+    /** 本集硬解失败的档位（codec|qNum）：降档/上爬时跳过，同一集不重复撞同一个死档。 */
+    private val failedTiers=mutableSetOf<String>()
+    /** 每剧向上探测计数：每 5 集把起播档抬高一级试一次（capped 到全局默认档），
+     *  给「这集片源其实能解更高档」自愈机会；失败会被自动降档拉回，约 1.5 秒、五集摊一次。 */
+    private val probeUp=mutableMapOf<String,Int>()
+    /** 本集起播档位：手动选择 > 本集探测重放 > 剧内已验证档 > 全局默认。 */
+    private fun startQuality(): Int =
+        sessionQuality ?: probeQuality
+        ?: verifiedQuality[detail?.series?.id.orEmpty()]?.takeIf { it>0 }
+        ?: library.maxQuality
+    private fun tierKey(t: StreamInfo)="${t.codec}|${t.qNum}"
     /**
      * 播放界面里的「播放设置」只作用于当前这部剧，不写回「设置 → 播放」里的全局默认。
      * 用户看这一部时想把倍速调到 1.5×、画面调成铺满，不该顺手改掉明天看别的剧时的默认值。
@@ -558,6 +606,9 @@ class MainActivity: Activity() {
     private var sessionFrame: VideoFrameMode?=null
     private var downgradeEpisode=""
     private var downgradeCount=0
+    /** 本集解码失败且阶梯耗尽后的「赌 CDN 换编码变体」自动重试，只做一次（2026-11-21 用户拍板）。
+     *  重试不打取址接口（阶梯缓存内零请求），失败面板再弹出来；换集/播通后复位。 */
+    private var decodeRetried=false
     private val tick=object: Runnable {
         override fun run() {
             if(!foreground || isDestroyed) return
@@ -691,6 +742,9 @@ class MainActivity: Activity() {
         RemoteAccess.init(this)
         XiaoAiAccess.init(this)
         accountManager=AccountManager(this,library)
+        // 登录态供给相关推荐：plan/v1 相关视频（show_type=160）只有登录身份才下发。
+        // 必须给完整凭证（Cookie + 账号设备身份），只给 Cookie 会因 did/iid 不配套被服务端当匿名。
+        repository.loginCookieProvider={ accountManager.account }
         accountManager.onAccountChanged={
             accountButton?.text=accountManager.accountLabel
             // 账号事件只在云端数据实际变化时才重建列表页：读取过程的每条状态文本
@@ -714,6 +768,17 @@ class MainActivity: Activity() {
         library.thirdHistoryRestore={ thirdStore.mergeHistory(it) }
         library.thirdFavoritesProvider={ thirdStore.backupFavorites() }
         library.thirdFavoritesRestore={ thirdStore.mergeFavorites(it) }
+        // 播放器键位/快进偏好（playback-extras-v1）与收藏排序随主备份写出/恢复（2026-11-21 查缺补漏）
+        library.extrasProvider={
+            mapOf("autoSkip" to extras.autoSkipUnplayable,"seekStep" to extras.seekStepSeconds,"fastSpeed" to extras.longPressSpeed,
+                "menuKeyAction" to extras.menuKeyAction,"dpadUpDownAction" to extras.dpadUpDownAction,
+                "mouseRightAction" to extras.mouseRightAction,"favoriteSort" to library.favoriteSort)
+        }
+        library.extrasRestore={ s ->
+            extras.autoSkipUnplayable=s.autoSkip; extras.seekStepSeconds=s.seekStep; extras.longPressSpeed=s.fastSpeed
+            extras.menuKeyAction=s.menuKeyAction; extras.dpadUpDownAction=s.dpadUpDownAction; extras.mouseRightAction=s.mouseRightAction
+            library.favoriteSort=s.favoriteSort
+        }
         InstallStatsPing.startOnce(applicationContext)
         backdropView=ImageView(this).apply { scaleType=ImageView.ScaleType.FIT_XY; importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO }
         loadBackdrop()
@@ -853,6 +918,7 @@ class MainActivity: Activity() {
         }
     }
     private fun base(title: String?=null): LinearLayout {
+        cancelLoadingAnim()
         root.removeAllViews(); root.setBackgroundColor(bg)
         backdropView?.takeIf { backdropBitmap!=null }?.let { root.addView(it,FrameLayout.LayoutParams(-1,-1)) }
         val container=column(); val horizontal=dp(widthDp()*.05f); val vertical=(resources.displayMetrics.heightPixels*.05f).toInt()
@@ -1001,6 +1067,44 @@ class MainActivity: Activity() {
         }
     }
     private fun message(parent: LinearLayout,label: String) { parent.addView(text(label,17f,muted).apply { setPadding(0,dp(28),0,dp(18)) }) }
+    private var loadingDotsAnim: Runnable?=null
+    private var loadingPulseAnim: ObjectAnimator?=null
+    /**
+     * 详情页加载过渡块（用户 2026-11-22）：居中的旋转指示器 + 加粗剧名 + 呼吸点状态行，
+     * 整块做呼吸透明度动画；毛玻璃封面背景透出，替换掉原来缩在左上角的一行小字。
+     */
+    private fun loadingBlock(parent: LinearLayout,title: String) {
+        cancelLoadingAnim()
+        val status=text("正在加载剧集",14f,white).apply { alpha=0.75f }
+        val block=column().apply {
+            gravity=Gravity.CENTER
+            addView(ProgressBar(this@MainActivity).apply {
+                isIndeterminate=true
+                indeterminateTintList=android.content.res.ColorStateList.valueOf(accent)
+            },lp(-2,-2).apply { gravity=Gravity.CENTER_HORIZONTAL })
+            addView(text(title,19f,white).apply { setTypeface(null,Typeface.BOLD); gravity=Gravity.CENTER },
+                lp(-2,-2).apply { topMargin=dp(14) })
+            addView(status,lp(-2,-2).apply { topMargin=dp(9) })
+        }
+        parent.addView(block,lp(-1,0).apply { weight=1f; topMargin=dp(20) })
+        loadingPulseAnim=ObjectAnimator.ofFloat(block,View.ALPHA,0.55f,1f).apply {
+            duration=900; repeatCount=ObjectAnimator.INFINITE; repeatMode=ObjectAnimator.REVERSE; start()
+        }
+        var dots=0
+        val tick=object: Runnable {
+            override fun run() {
+                dots=(dots+1)%4
+                status.text="正在加载剧集"+"·".repeat(dots)
+                main.postDelayed(this,420L)
+            }
+        }
+        loadingDotsAnim=tick; main.postDelayed(tick,420L)
+    }
+    /** 任何页面重建都会经过 base()：在这里统一停掉加载动画，避免回调打到已拆掉的 View。 */
+    private fun cancelLoadingAnim() {
+        loadingDotsAnim?.let { main.removeCallbacks(it) }; loadingDotsAnim=null
+        loadingPulseAnim?.cancel(); loadingPulseAnim=null
+    }
     private fun error(parent: LinearLayout,problem: Throwable,retry: ()->Unit) {
         message(parent,"暂时无法加载，请检查网络后重试。")
         val detail=if(problem is java.net.UnknownHostException) "无法连接内容网站" else if(problem is java.net.SocketTimeoutException) "连接超时" else problem.message.orEmpty().replace(Regex("https?://\\S+"),"[地址]").take(160)
@@ -1029,6 +1133,8 @@ class MainActivity: Activity() {
             tabState.remove(1); tabFocus.remove(1)
         }
         tab=next; val saved=tabState[next]; page=saved?.page ?: 1; catalog=saved?.items ?: emptyList(); hasMore=saved?.hasMore ?: false; ranking=saved?.ranking; catalogFocus=tabFocus[next].orEmpty()
+        // 重新进最近观看页回到默认折叠形态，云端记录始终两屏内可达
+        if(next==4) historyShowAll=false
         rankBoard=saved?.board ?: rankBoard; genre=saved?.genre ?: genre
         aiCatalog=saved?.aiCatalog ?: false; aiGenre=saved?.aiGenre
         newRelease=saved?.newRelease ?: false; newReleaseWindow=saved?.newReleaseWindow ?: newReleaseWindow
@@ -1735,6 +1841,16 @@ class MainActivity: Activity() {
         // 云端收藏的续播角标来自云端观看记录：没拉到同样顺手补拉，拉到后经签名变化重建
         if(tab==3 && !favoriteManage && collection==null && accountManager.signedIn &&
             !accountManager.cloudHistoryLoaded && !accountManager.isBusy) accountManager.refreshHistory()
+        val cols=if(tab==1 && !advancedSearch) searchColumns else gridColumns
+        // 最近观看页本机记录默认折叠成两行：第二行末格是「查看全部」卡（与首页货架尾卡同款），
+        // 点开展开全部。不折叠时本机记录一长，要往下翻很久才到云端区（用户 2026-11-24）。
+        // 云端记录/云端收藏区不受影响，始终跟在折叠后的本机区后面。
+        var historyMore=false
+        val localTotal=displayed.size
+        if(tab==4 && collection==null && !historyShowAll && displayed.size>2*cols) {
+            while(displayed.size>2*cols-1) displayed.removeAt(displayed.size-1)
+            historyMore=true
+        }
         val localCount=displayed.size
         if(cloudRows.isNotEmpty()) displayed+=cloudRows.map { it.series }
         if(cloudFavs.isNotEmpty()) displayed+=cloudFavs.map { it.series }
@@ -1744,14 +1860,15 @@ class MainActivity: Activity() {
             if(focusType) typeButtons[library.contentType]?.requestFocus() else if(focusFilter && favoriteFilterButtons.isNotEmpty()) favoriteFilterButtons[favoriteFilterFocus.coerceIn(0,favoriteFilterButtons.size-1)].requestFocus() else if(collectionBack!=null && !focusNav) collectionBack?.requestFocus() else nav[tab].requestFocus()
             return
         }
-        val cols=if(tab==1 && !advancedSearch) searchColumns else gridColumns
         val adapter=CatalogAdapter(displayed,cols)
+        if(historyMore) { adapter.morePos=localCount+(if(localCount>0) 1 else 0); adapter.moreTotal=localTotal }
         if(cloudRows.isNotEmpty()) {
             adapter.cloudRows=cloudRows
             adapter.cloudStart=localCount
             adapter.headers=buildMap {
                 if(localCount>0) put(0,"本机记录")
-                put(localCount+if(localCount>0) 1 else 0,"云端记录")
+                // 「查看全部」卡占一格：云端区标题的 adapter 位置要再让一位
+                put(localCount+(if(localCount>0) 1 else 0)+(if(historyMore) 1 else 0),"云端记录")
             }
         }
         if(cloudFavs.isNotEmpty()) {
@@ -1899,7 +2016,7 @@ class MainActivity: Activity() {
                 val focused=recycler.focusedChild
                 var pos=if(focused!=null) recycler.getChildAdapterPosition(focused) else RecyclerView.NO_POSITION
                 if(pos==RecyclerView.NO_POSITION) pos=catalogFocusPos
-                if(pos!=RecyclerView.NO_POSITION && !adapter.isHeader(pos) && !adapter.isFooter(pos)) {
+                if(pos!=RecyclerView.NO_POSITION && !adapter.isHeader(pos) && !adapter.isFooter(pos) && !adapter.isMore(pos)) {
                     val index=adapter.displayedIndex(pos)
                     if(index in 0 until adapter.displayed.size) {
                         val target=adapter.gridNeighbor(index,1)
@@ -1928,7 +2045,7 @@ class MainActivity: Activity() {
                 val focused=recycler.focusedChild
                 var pos=if(focused!=null) recycler.getChildAdapterPosition(focused) else RecyclerView.NO_POSITION
                 if(pos==RecyclerView.NO_POSITION) pos=catalogFocusPos
-                if(pos!=RecyclerView.NO_POSITION && !adapter.isHeader(pos) && !adapter.isFooter(pos)) {
+                if(pos!=RecyclerView.NO_POSITION && !adapter.isHeader(pos) && !adapter.isFooter(pos) && !adapter.isMore(pos)) {
                     val index=adapter.displayedIndex(pos)
                     if(index in 0 until adapter.displayed.size) {
                         val target=adapter.gridNeighbor(index,-1)
@@ -1939,8 +2056,15 @@ class MainActivity: Activity() {
                             val up=when(tab) {
                                 2 -> (when { newRelease -> newReleaseBack ?: newReleaseWindowButton ?: rankRefresh; aiCatalog -> aiEntry ?: aiGenreButton; else -> rankSwitch ?: rankRefresh })
                                     ?: nav.getOrNull(tab)
-                                1 -> searchInput ?: searchButton ?: searchActions.firstOrNull()?.takeIf { it.isFocusable }
-                                    ?: typeButtons[library.contentType] ?: nav.getOrNull(tab)
+                                // 高级搜索：关键词搜索行是隐藏的（searchInput 等为 GONE），此前首行 ↑ 落到
+                                // 隐藏视图上 requestFocus 静默失败＝卡片上按不上去（2026-11-23 用户反馈）。
+                                // 展开时回条件区末行，收起时回「展开筛选」按钮，两者都接得回「‹ 返回关键词搜索」→ 顶栏。
+                                1 -> (if(advancedSearch) {
+                                    if(filterExpanded) filterRows.lastOrNull()?.firstOrNull() else filterCollapse ?: filterToggle
+                                } else {
+                                    searchInput ?: searchButton ?: searchActions.firstOrNull()?.takeIf { it.isFocusable }
+                                        ?: typeButtons[library.contentType]
+                                }) ?: nav.getOrNull(tab)
                                 else -> historyRefresh ?: historySync ?: historyManage ?: favoriteCheck ?: favoriteSortFirst
                                     ?: genreClear ?: collectionBack ?: typeButtons[library.contentType]
                                     ?: segmentFirst ?: nav.getOrNull(tab)
@@ -2112,18 +2236,25 @@ class MainActivity: Activity() {
         /** 收藏页云端区：只读展示，卡片可带云端进度角标。 */
         var cloudFavs: List<CloudFavorite> = emptyList()
         var cloudFavStart=Int.MAX_VALUE
+        /** 「查看全部」卡（最近观看本机区折叠尾卡）的 adapter 位置；-1=无。该卡不对应 displayed 条目。 */
+        var morePos=-1
+        /** 折叠前的本机记录总数：更多卡副标「共 N 部」用。 */
+        var moreTotal=-1
         fun isHeader(position: Int)=headers.containsKey(position)
-        fun isFooter(position: Int)=footer!=FOOTER_NONE && position==displayed.size+headers.size
-        /** adapter 位置 → displayed 下标（前面每有一个分节标题就减一）。 */
+        fun isMore(position: Int)=morePos>=0 && position==morePos
+        fun isFooter(position: Int)=footer!=FOOTER_NONE && position==displayed.size+headers.size+(if(morePos>=0) 1 else 0)
+        /** adapter 位置 → displayed 下标（前面每有一个分节标题或「查看全部」卡就减一）。 */
         fun displayedIndex(position: Int): Int {
             var index=position
             for(key in headers.keys) if(key<position) index--
+            if(morePos>=0 && morePos<position) index--
             return index
         }
         /** displayed 下标 → adapter 位置。 */
         fun adapterPosition(index: Int): Int {
             var position=index
             for(key in headers.keys.sorted()) if(key<=position) position++
+            if(morePos>=0 && morePos<=position) position++
             return position
         }
         /** displayed 下标 i 前面是否紧贴一个分节标题（标题独占一行，网格行计算要跳过）。 */
@@ -2134,10 +2265,10 @@ class MainActivity: Activity() {
         /** 同列上/下一视觉行的卡片下标：跨「本机/云端」分节标题无缝移动，没有则 -1。 */
         fun gridNeighbor(index: Int, dir: Int): Int =
             GridNav.neighbor(GridNav.coordinates(displayed.size,cols,::sectionStart),index,dir)
-        override fun getItemCount()=displayed.size+headers.size+if(footer!=FOOTER_NONE) 1 else 0
-        override fun getItemViewType(position: Int)=if(isHeader(position)) TYPE_HEADER else if(isFooter(position)) TYPE_FOOTER else TYPE_CARD
+        override fun getItemCount()=displayed.size+headers.size+(if(morePos>=0) 1 else 0)+if(footer!=FOOTER_NONE) 1 else 0
+        override fun getItemViewType(position: Int)=if(isHeader(position)) TYPE_HEADER else if(isFooter(position)) TYPE_FOOTER else if(isMore(position)) TYPE_MORE else TYPE_CARD
         fun updateFooter(next: Int) {
-            val footerPos=displayed.size+headers.size
+            val footerPos=displayed.size+headers.size+(if(morePos>=0) 1 else 0)
             if(footer==next) { if(next!=FOOTER_NONE) notifyItemChanged(footerPos); return }
             val had=footer!=FOOTER_NONE; footer=next
             if(next==FOOTER_NONE) notifyItemRemoved(footerPos)
@@ -2154,6 +2285,23 @@ class MainActivity: Activity() {
                 val frame=FrameLayout(this@MainActivity)
                 frame.layoutParams=RecyclerView.LayoutParams(-1,-2).apply { rightMargin=dp(14); bottomMargin=dp(10) }
                 return object: RecyclerView.ViewHolder(frame) {}
+            }
+            if(viewType==TYPE_MORE) {
+                // 与首页货架尾卡同款：大「›」占海报位 +「查看全部」标题 + 分区名副标
+                val card=column(); card.setPadding(dp(4),dp(4),dp(4),dp(9)); focusStyle(card)
+                val art=object: FrameLayout(this@MainActivity) {
+                    override fun onMeasure(widthMeasureSpec: Int,heightMeasureSpec: Int) {
+                        val w=MeasureSpec.getSize(widthMeasureSpec)
+                        super.onMeasure(widthMeasureSpec,MeasureSpec.makeMeasureSpec((w/TvStyle.POSTER_ASPECT).toInt(),MeasureSpec.EXACTLY))
+                    }
+                }
+                art.addView(TextView(this@MainActivity).apply { text="›"; textSize=34f; gravity=Gravity.CENTER },FrameLayout.LayoutParams(-1,-1))
+                val title=text("查看全部",14f).apply { gravity=Gravity.TOP; includeFontPadding=true; maxLines=2; ellipsize=TextUtils.TruncateAt.END; setPadding(dp(3),dp(7),dp(3),0) }
+                title.measure(View.MeasureSpec.makeMeasureSpec(0,View.MeasureSpec.UNSPECIFIED),View.MeasureSpec.makeMeasureSpec(0,View.MeasureSpec.UNSPECIFIED))
+                val badge=text("",12f,muted).apply { minLines=1; minHeight=dp(19); ellipsize=TextUtils.TruncateAt.END; setPadding(dp(3),0,0,0) }
+                card.addView(art,lp(-1,-2)); card.addView(title,lp(-1,title.measuredHeight)); card.addView(badge,lp(-1,-2))
+                card.layoutParams=RecyclerView.LayoutParams(-1,-2).apply { rightMargin=dp(14); bottomMargin=dp(10) }
+                return object: RecyclerView.ViewHolder(card) {}
             }
             val card=column(); card.setPadding(dp(4),dp(4),dp(4),dp(9)); focusStyle(card)
             // 海报容器按自身实际测量宽度定高，回收复用、列宽变化都不会出现同屏高低不一
@@ -2184,6 +2332,19 @@ class MainActivity: Activity() {
         override fun onBindViewHolder(holder: RecyclerView.ViewHolder,position: Int) {
             if(getItemViewType(position)==TYPE_HEADER) { (holder.itemView as TextView).text=headers[position]; return }
             if(getItemViewType(position)==TYPE_FOOTER) { bindFooter(holder.itemView as FrameLayout); return }
+            if(getItemViewType(position)==TYPE_MORE) {
+                val card=holder.itemView as LinearLayout
+                (card.getChildAt(1) as TextView).text="查看全部"
+                (card.getChildAt(2) as TextView).text="本机记录"+if(moreTotal>0) " · 共 $moreTotal 部" else ""
+                card.contentDescription="查看全部本机记录"
+                card.setOnClickListener {
+                    // 展开：焦点落在折叠时看不到的第一张卡上，视觉连续
+                    historyShowAll=true
+                    catalogFocus=displayed.getOrNull(2*cols-1)?.id ?: ""
+                    showCatalog()
+                }
+                return
+            }
             holder as CardHolder
             val di=displayedIndex(position)
             val item=displayed[di]; holder.boundId=item.id
@@ -2335,7 +2496,22 @@ class MainActivity: Activity() {
             val revealOnce={ if(!revealed) { revealed=true; revealFreeFeed(startedAt) } }
             work({ repository.detailLite(series.id) },{ d ->
                 recommendDetails[series.id]=d
-                android.util.Log.i("HongguoTV","FreeFeed first detail ready after ${android.os.SystemClock.elapsedRealtime()-startedAt}ms")
+                // 揭幕前把本部续播集的地址也备好（用户 2026-11-23：首次进入偏慢）：
+                // 过渡动画还剩几百毫秒，正好并行打这一发取址；起播时 playEpisode 命中
+                // recommendStreams 直接 prepare，省掉一次串行的取址往返（约 0.5~1 秒）。
+                val progress=library.progress(series.id)
+                val target=ResumePlayback.target(d.episodes,progress?.episodeId,progress?.position ?: 0,progress?.completed==true)
+                val episode=d.episodes.getOrNull(target.index)
+                val fresh=episode!=null && recommendStreams[episode]?.let { android.os.SystemClock.elapsedRealtime()-it.first<10*60_000L }==null
+                if(fresh) {
+                    val maxQ=library.maxQuality; val wanted=episode!!
+                    prefetchWorker.submit {
+                        runCatching { repository.stream(wanted,maxQ,quiet=true) }.getOrNull()?.let {
+                            recommendStreams[wanted]=android.os.SystemClock.elapsedRealtime() to it
+                        }
+                    }
+                }
+                android.util.Log.i("HongguoTV","FreeFeed first detail ready after ${android.os.SystemClock.elapsedRealtime()-startedAt}ms streamPrefetch=${fresh}")
                 revealOnce()
             },{ _ -> revealOnce() })
             // 兜底：详情 3.5 秒还没回来也照样揭幕，让 openDetail 自己的加载顶上，动画不至于一直盖着
@@ -2438,7 +2614,7 @@ class MainActivity: Activity() {
         val cached=recommendDetails[series.id]
         val open={ if(cached!=null) openDetail(series,resume=true,preloaded=cached) else openDetail(series,resume=true) }
         // 换剧整页重建，中间一样会黑：先冻住当前画面，新剧首帧渲染出来才撤（用户 2026-11-19）
-        if(screen=="player" && player!=null && playerView!=null) freezeFrame(loadingTip) { open() }
+        if(screen=="player" && player!=null && playerView!=null) freezeFrame(seriesLoadingTip) { open() }
         else open()
     }
 
@@ -2462,24 +2638,33 @@ class MainActivity: Activity() {
     }
 
     /** 预取当前部起后面几部的详情与首集地址：独立线程池，绝不占用起播队列。
-     *  首页预热传 -1（推荐第 0、1 部），点进自由刷剧传 recommendCursor（第 1、2 部）。 */
+     *  首页预热传 -1（只备推荐第 0 部），点进自由刷剧传 recommendCursor（第 1、2 部）。 */
     private fun prefetchRecommend(index: Int) {
         if(recommendPrefetching==index) return
         recommendPrefetching=index
+        // 两部预取收进同一个任务串行取址：此前每部各开一个线程并发打取址接口，
+        // 加上起播那一发，进自由刷剧瞬间 3 个取址齐飞，服务端风控敏感期极易当场触发冷却
+        // （2026-11-23 用户实测「一进自由刷剧就限流」）。串行后峰值并发降到 2。
+        // 目标集必须在主线程先取好（library 非线程安全），后台只做网络。
+        val targets=mutableListOf<Pair<Int,Pair<String,String?>>>()
         for(offset in 1..2) {
             val next=recommendItems.getOrNull(index+offset) ?: continue
-            // 起播集不一定是第 1 集：看过一半的剧会从上次那集继续。这里在主线程把目标集取出来
-            // 交给后台去备，否则预取永远只备第 1 集，续播场景必然 miss。
-            val wantedEpisode=library.progress(next.id)?.episodeId
-            prefetchWorker.submit {
+            // 首页预热只备「紧邻下一部」的地址：用户停在首页不点刷剧时，每次开 App
+            // 白发 2 个取址请求纯添风控密度（2026-11-23）；进 feed 后起播成功还会再调一次，届时两部都备。
+            if(index<0 && offset==2) continue
+            targets+=offset to (next.id to library.progress(next.id)?.episodeId)
+        }
+        prefetchWorker.submit {
+            for((offset,target) in targets) {
+                val (seriesId,wantedEpisode)=target
                 // 详情已经缓存过也要继续往下走：地址/首块可能还没备，跳过就等于白预取
-                val detail=recommendDetails[next.id] ?: runCatching { repository.detailLite(next.id) }.getOrNull()
-                    ?.also { recommendDetails[next.id]=it } ?: return@submit
-                val episode=detail.episodes.firstOrNull { it==wantedEpisode } ?: detail.episodes.firstOrNull() ?: return@submit
+                val detail=recommendDetails[seriesId] ?: runCatching { repository.detailLite(seriesId) }.getOrNull()
+                    ?.also { recommendDetails[seriesId]=it } ?: continue
+                val episode=detail.episodes.firstOrNull { it==wantedEpisode } ?: detail.episodes.firstOrNull() ?: continue
                 val now=android.os.SystemClock.elapsedRealtime()
                 val info=recommendStreams[episode]?.takeIf { now-it.first<10*60*1000L }?.second
-                    ?: runCatching { repository.stream(episode,library.maxQuality) }.getOrNull()
-                        ?.also { recommendStreams[episode]=now to it } ?: return@submit
+                    ?: runCatching { repository.stream(episode,library.maxQuality,quiet=true) }.getOrNull()
+                        ?.also { recommendStreams[episode]=now to it } ?: continue
                 // 只给「紧邻的下一部」预读首块：换剧时 RemoteVideo 已经能直接用，省掉现场 prepare 的 0.5~1 秒。
                 // 再往后那部只备地址——慢网下每部多下 2MB 会跟正在播的抢带宽。
                 if(offset==1 && !recommendVideos.containsKey(episode)) {
@@ -2493,7 +2678,7 @@ class MainActivity: Activity() {
                         android.util.Log.i("HongguoTV","Prefetch video ready episode=$episode from=$index")
                     }
                 }
-                android.util.Log.i("HongguoTV","Prefetch recommend from=$index id=${next.id} episode=$episode stream=${recommendStreams.containsKey(episode)}")
+                android.util.Log.i("HongguoTV","Prefetch recommend from=$index id=$seriesId episode=$episode stream=${recommendStreams.containsKey(episode)}")
             }
         }
     }
@@ -2549,12 +2734,7 @@ class MainActivity: Activity() {
                 } else {
                     main.removeCallbacks(feedLongRunnable)
                     if(feedLongSeeking) { feedLongSeeking=false; feedLongDir=0; updatePlaybackText(); showHud() }
-                    else if(skipEpisode(dir)) {
-                        // 「已开启本剧连播」只在真的从自动下滑切成连播时说一次；之后每次换集不再重复弹
-                        val opening=!feedSeriesBinge && library.feedAutoSwipe
-                        feedSeriesBinge=true
-                        if(opening && !bingeHintShown) { bingeHintShown=true; showBingeBadge() }
-                    }
+                    else feedSkipEpisode(dir)
                 }
                 return true
             }
@@ -2599,6 +2779,16 @@ class MainActivity: Activity() {
         // 长按确认进详情但保留 feed 上下文：在详情页按返回直接续播当前剧（用户 2026-11-18）
         feedDetailBrowsing=true
         returnToDetail(forceDetail=true)
+    }
+
+    /** feed 短按 ←/→ 换集：转本剧连播并按需提示。实体遥控（handleRecommendKey）与手机遥控（remoteDpad）共用。 */
+    private fun feedSkipEpisode(dir: Int) {
+        if(skipEpisode(dir)) {
+            // 「已开启本剧连播」只在真的从自动下滑切成连播时说一次；之后每次换集不再重复弹
+            val opening=!feedSeriesBinge && library.feedAutoSwipe
+            feedSeriesBinge=true
+            if(opening && !bingeHintShown) { bingeHintShown=true; showBingeBadge() }
+        }
     }
 
     /** 开启本剧连播时给一句提示，避免用户以为「下滑换剧」坏了。 */
@@ -2766,6 +2956,7 @@ class MainActivity: Activity() {
         val saver=groupColumn()
         val device=groupColumn()
         val lab=groupColumn()
+        val guide=groupColumn()
         val about=groupColumn()
         val settingRows=mutableListOf<TextView>()
         val groupRows=linkedMapOf<LinearLayout,MutableList<TextView>>()
@@ -2807,6 +2998,7 @@ class MainActivity: Activity() {
             Triple("待机屏保","空闲后自动盖屏：挑自带画面，或用手机传自己的",saver),
             Triple("设备与数据","账号、本机记录与快传文件",device),
             Triple("实验室功能","外部遥控、语音与自动化接口",lab),
+            Triple("使用说明","整套系统的介绍与用法：键位、功能、常见问题",guide),
             Triple("关于红果","版本更新、接口自检与许可",about))
         var active=0
         val railButtons=categories.map { entry ->
@@ -2829,6 +3021,8 @@ class MainActivity: Activity() {
         heading(playback,"播放与观看",categories[0].second)
         lateinit var qualityButton: TextView
         qualityButton=setting(playback,"默认清晰度  ·  ${library.maxQuality}P") { showQualityPicker(qualityButton,false) }
+        lateinit var softQualityButton: TextView
+        softQualityButton=setting(playback,"软解清晰度  ·  ${library.softQuality}P") { showSoftQualityPicker(softQualityButton) }
         lateinit var defaultSpeed: TextView
         defaultSpeed=setting(playback,"默认倍速  ·  ${PlaybackSpeed.label(library.playbackSpeed)}") { showSpeedPicker(defaultSpeed,false) }
         lateinit var frame: TextView
@@ -3071,6 +3265,48 @@ class MainActivity: Activity() {
             val bytes=cacheBytes()
             main.post { if(!isDestroyed) clearCache.text=cacheLabel(bytes) }
         }
+        // 崩溃日志（用户 2026-11-21）：默认关闭；文件在 cacheDir/crash，「清理缓存」会自动带走，这里另给单独清理与扫码导出
+        subHeading(device,"诊断")
+        fun crashBytes()=CrashLogger.sizeBytes(this)
+        fun crashLabel(bytes: Long?)="清理崩溃日志  ·  ${when {
+            bytes==null -> "计算中…"
+            bytes==0L -> "无日志"
+            bytes in 1..1023 -> "$bytes B"; bytes in 1024..1048575 -> "${bytes/1024} KB"; else -> "%.1f MB".format(bytes/1048576f)
+        }}（${CrashLogger.files(this).size} 个文件）"
+        lateinit var crashToggle: TextView
+        crashToggle=setting(device,"崩溃日志记录  ·  ${if(CrashLogger.enabled(this)) "已开启" else "已关闭"}") {
+            val next=!CrashLogger.enabled(this)
+            CrashLogger.setEnabled(this,next)
+            crashToggle.text="崩溃日志记录  ·  ${if(next) "已开启" else "已关闭"}"
+            Toast.makeText(this,if(next) "已开启：发生崩溃时会记录日志" else "已关闭：不再记录新日志（旧日志保留）",Toast.LENGTH_SHORT).show()
+        }
+        lateinit var crashExport: TextView
+        crashExport=setting(device,"导出崩溃日志  ·  手机扫码") {
+            if(!CrashLogger.enabled(this) && CrashLogger.sizeBytes(this)==0L) {
+                tvTools.info("导出崩溃日志","当前没有崩溃日志，也没有开启记录。开启后再次遇到崩溃即可回来导出。",crashExport)
+            } else {
+                io.execute {
+                    val logs=CrashLogger.combined(this@MainActivity)
+                    main.post {
+                        if(isDestroyed) return@post
+                        if(logs==null) tvTools.info("导出崩溃日志","当前没有崩溃日志。",crashExport)
+                        else tvTools.crashLogTransfer(logs,crashExport)
+                    }
+                }
+            }
+        }
+        lateinit var crashClear: TextView
+        crashClear=setting(device,crashLabel(null)) {
+            if(CrashLogger.sizeBytes(this)==0L) { Toast.makeText(this,"当前没有崩溃日志",Toast.LENGTH_SHORT).show() }
+            else TvDialog.confirm(this,"清理崩溃日志","删除本机保存的全部崩溃日志文件，不影响其他数据。") {
+                io.execute {
+                    CrashLogger.clear(this@MainActivity)
+                    val remaining=CrashLogger.sizeBytes(this@MainActivity)
+                    main.post { if(!isDestroyed) { crashClear.text=crashLabel(remaining); Toast.makeText(this@MainActivity,"崩溃日志已清理",Toast.LENGTH_SHORT).show() } }
+                }
+            }.show()
+        }
+        io.execute { val bytes=crashBytes(); main.post { if(!isDestroyed) crashClear.text=crashLabel(bytes) } }
         // 侧栏底部「常用」（用户 2026-11-19）：屏幕放不下就跟侧栏一起滚动，不为了塞下它去砍分类
         lateinit var quickSend: TextView
         quickSend=railAction("手机快传  ·  传 APK / 视频") {
@@ -3099,7 +3335,18 @@ class MainActivity: Activity() {
         xiaoAiButton=setting(lab,xiaoAiLabel()) { showXiaoAiDialog(xiaoAiButton) }
         lateinit var proxyButton: TextView
         proxyButton=setting(lab,proxyLabel()) { showProxyDialog(proxyButton) }
-        heading(about,"关于红果",categories[6].second)
+        heading(guide,"使用说明",categories[6].second)
+        // 每个主题一条说明弹窗：正文包在滚动区里，遥控上下键直接翻页（TvDialog.bindScrollKeys），
+        // 关闭后焦点回到刚才那条，继续往下看下一主题
+        val guideRows=UsageGuide.TOPICS.map { TextView(this) }.toMutableList()
+        UsageGuide.TOPICS.forEachIndexed { index,(name,body) ->
+            guideRows[index]=setting(guide,name) {
+                val dlg=TvDialog.info(this,"使用说明 · $name",body)
+                dlg.setOnDismissListener { runCatching { guideRows[index].requestFocus() } }
+                dlg.show()
+            }
+        }
+        heading(about,"关于红果",categories[7].second)
         lateinit var updates: TextView
         updates=setting(about,"版本与更新  ·  ${BuildConfig.VERSION_NAME}") { updater.show(updates) }
         lateinit var checkButton: TextView
@@ -3295,7 +3542,7 @@ class MainActivity: Activity() {
         query=""; (searchInput as? EditText)?.setText("")
         page=1; catalog=emptyList(); hasMore=false; catalogFocus=""; discoveryCursor=null; pendingFilterFocus=null
         // 每次进入高级搜索都展开筛选，收起状态只在本次会话内保持
-        if(value) filterExpanded=true
+        if(value) { filterExpanded=true; filterAutoCollapse=true }
         tabState.remove(1); tabFocus.remove(1); searchFocusPending=false
         showCatalog(load=value)
         main.post { if(advancedSearch==value) (if(value) filterToggle ?: filterPanel else searchInput)?.requestFocus() }
@@ -3400,7 +3647,12 @@ class MainActivity: Activity() {
         val visualLines=(others.size+1)/2
         val groupsScroll=ScrollView(this).apply { isVerticalScrollBarEnabled=false; clipToPadding=false; visibility=if(filterExpanded) View.VISIBLE else View.GONE }
         groupsScroll.addView(groupsHost)
-        host.addView(groupsScroll,lp(-1,if(others.isEmpty()) -2 else dp(minOf(visualLines,4)*34)))
+        // 条件区可见行数按屏幕高度自适应：540P 小电视固定 4 行会把一行卡片裁到只剩 3/4
+        // （2026-11-23 用户问「小电视是不是只能显示部分卡片」，实测 1080P 没事、540P 推演裁切）。
+        // 挤掉的高度从条件区出——其余行用 ScrollView 滚，保证手动展开时结果区至少有一行完整卡片。
+        val screenHdp=resources.displayMetrics.heightPixels/resources.displayMetrics.density
+        val maxRows=if(screenHdp>=680) 4 else if(screenHdp>=560) 2 else 1
+        host.addView(groupsScroll,lp(-1,if(others.isEmpty()) -2 else dp(minOf(visualLines,maxRows)*34)))
         filterGroupsScroll=groupsScroll
         // 焦点严格按视觉行走线：首行是类型选项+操作按钮，其余每行左右两组条件。
         // ←/→ 跨组相连，↑/↓ 在同一半区内按位置落到上/下一行，告别按↓却平移到同行另一组的跳动感
@@ -3491,7 +3743,12 @@ class MainActivity: Activity() {
         work({ repository.filteredDiscovery(selection,null) }, { result ->
             catalog=result.items; hasMore=result.next!=null; discoveryGroups=result.groups; discoveryCursor=result.next; page=1
             val keepNav=nav.any { it.hasFocus() }
-            renderFilterPanel()
+            // 首次出结果自动收起筛选面板（issue #35.2）：展开的面板占掉大半屏，
+            // 结果只剩一行还滚不动观感像「展示不全」。收起后结果占满屏；
+            // 摘要行仍在，要改条件点「展开筛选」。只做一次，之后尊重用户手动展开。
+            if(advancedSearch && filterAutoCollapse && result.items.isNotEmpty() && filterExpanded) {
+                filterAutoCollapse=false; filterExpanded=false; renderFilterPanel()
+            }
             body.removeAllViews(); catalogGrid(body,keepNav,false)
             main.post {
                 val key=pendingFilterFocus.also { pendingFilterFocus=null }
@@ -3711,7 +3968,7 @@ class MainActivity: Activity() {
         if(!keepPlayer) {
             val built=base(series.title); body=built
             // 自由刷剧：过渡动画揭开后直接进播放，中间的「正在加载剧集…」详情页不显示（用户 2026-11-18），保持纯黑过渡
-            if(recommendMode) { built.visibility=View.GONE; root.setBackgroundColor(Color.BLACK) } else message(built,"正在加载剧集…")
+            if(recommendMode) { built.visibility=View.GONE; root.setBackgroundColor(Color.BLACK) } else loadingBlock(built,series.title)
         }
         val apply:(Detail)->Unit={ result ->
             detail=result; library.observeFavorite(series.id,result.episodes.size,System.currentTimeMillis(),acknowledge=true)
@@ -3966,10 +4223,13 @@ class MainActivity: Activity() {
         // 拿 16:9 的尺寸去接就等于硬拉伸——竖屏剧被压扁、4:3 剧被拉宽（用户 2026-11-20）。
         // 只缩不放：4K 剧不能为了一张截图分配 33MB。比例一致，PixelCopy 不会变形。
         val vs=player?.videoSize
-        var shotW=pv.width; var shotH=pv.height
+        // 兜底尺寸必须用 SurfaceView（视频容器，AspectRatioFrameLayout 已按视频比例校正），
+        // 不能用 pv（PlayerView 全屏 16:9）：videoSize 无效时（如 bvc2 软解集旧版），
+        // 16:9 尺寸会把竖屏冻结帧横向拉伸（2026-11-21 真机复现）。
+        var shotW=surface.width; var shotH=surface.height
         if(vs!=null && vs.width>0 && vs.height>0) {
             val cap=FREEZE_MAX_EDGE/maxOf(vs.width,vs.height).toFloat()
-            val fit=minOf(pv.width.toFloat()/vs.width,pv.height.toFloat()/vs.height,1f,cap)
+            val fit=minOf(surface.width.toFloat()/vs.width,surface.height.toFloat()/vs.height,1f,cap)
             shotW=(vs.width*fit).toInt().coerceAtLeast(2)
             shotH=(vs.height*fit).toInt().coerceAtLeast(2)
         }
@@ -4004,6 +4264,10 @@ class MainActivity: Activity() {
             if(shot!=null) (layer.getChildAt(0) as? ImageView)?.let { it.setImageBitmap(shot); it.visibility=View.VISIBLE }
             return
         }
+        // 过渡层挂起期间关掉 ExoPlayer 自带的缓冲圈（issue #35.1）：新集 prepare 缓冲时
+        // PlayerView 的默认大圈会和过渡层的 38dp 小圈叠着转，「两个转圈一大一小」。
+        // 撤层时恢复，正常播放中的缓冲提示不受影响。
+        playerView?.setShowBuffering(PlayerView.SHOW_BUFFERING_NEVER)
         // 上一个过渡层还在淡出（连按换集）：立刻收掉，否则两层半透明叠着会发灰
         freezeFading?.let { old ->
             old.animate().cancel()
@@ -4054,11 +4318,13 @@ class MainActivity: Activity() {
      *  这不增加等待——用户在这一刻已经能看到新内容，只是旧帧还叠着半透明的一层；
      *  真要离开播放页（回首页、露错误面板）时必须传 false，否则旧帧会盖住下一页。 */
     private fun releaseFreeze(fade: Boolean=false) {
-        freezeFade?.let { main.removeCallbacks(it) }; freezeFade=null
+        freezeFade?.let { main.removeCallbacks(it); }; freezeFade=null
         // 500ms 内切完时这个任务还没到点，撤掉就等于 loading 从未出现过
         freezeLoadingJob?.let { main.removeCallbacks(it) }; freezeLoadingJob=null
         val layer=freezeLayer ?: return
         freezeLayer=null; freezeTip=null
+        // 过渡层撤掉后恢复 ExoPlayer 自带缓冲圈（showFreezeLayer 里为防双圈临时关掉）
+        playerView?.setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
         val alive=android.os.SystemClock.elapsedRealtime()-freezeShownAt
         android.util.Log.w("HongguoTV","Freeze release alive=${alive}ms fade=$fade")
         // 上一层还在淡出（连按换集）：立刻收掉，别让两层的半透明叠在一起发灰
@@ -4077,8 +4343,33 @@ class MainActivity: Activity() {
             }
             .start()
     }
+    /** 播放器单例构建：融合构建挂 vc2 渲染器工厂（bvc2 软解进同一个 ExoPlayer），否则用默认工厂。 */
+    private fun createPlayer(): ExoPlayer {
+        val load=DefaultLoadControl.Builder().setBufferDurationsMs(20000,50000,1000,5000).setTargetBufferBytes(32*1024*1024).build()
+        val rf0=Vc2.api.renderersFactory(this)
+        val renderers=(rf0 ?: androidx.media3.exoplayer.DefaultRenderersFactory(this)).setEnableDecoderFallback(true)
+        return ExoPlayer.Builder(this,renderers).setLoadControl(load).build().also {
+            player=it; playerView?.player=it
+            it.setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(),true)
+            it.setHandleAudioBecomingNoisy(true)
+        }
+    }
     /** 过渡层转圈下的小字：只写「正在载入中...」，剧名/集数不重复报（用户 2026-11-20）。 */
     private val loadingTip="正在载入中..."
+    /** 换剧专用文案（用户 2026-11-23）：上下切剧与换集区分开，让用户知道是在换一部新剧。 */
+    private val seriesLoadingTip="新剧载入中..."
+    /** 统一的 MediaSource 构建：融合开关打开时挂 Vc2ExtractorsFactory（嗅探式接管 bvc2），
+     *  关闭时与改造前完全一致（单参 Factory + 默认 Mp4Extractor）。 */
+    private fun mediaSourceFor(remote: RemoteVideo,mediaId: String): MediaSource {
+        val ds=androidx.media3.datasource.DataSource.Factory { VideoDataSource(remote) }
+        val ex=Vc2.api.extractorsFactory()
+        val factory=if(ex!=null) ProgressiveMediaSource.Factory(ds,ex)
+            else ProgressiveMediaSource.Factory(ds)
+        return factory.createMediaSource(
+            MediaItem.Builder().setMediaId(mediaId).setUri("hongguotv://episode/$mediaId")
+                .setMimeType(MimeTypes.VIDEO_MP4).build())
+    }
+
     private fun playEpisode(index: Int,position: Long=0,autoplay: Boolean=true,recovering: Boolean=false,transition: Boolean=false,preservePlayer: Boolean=false) {
         val data=detail ?: return
         // 播放页里换集要重建播放器：先冻住当前这一帧再切，等新一集首帧渲染出来才撤
@@ -4100,20 +4391,64 @@ class MainActivity: Activity() {
         val reuse=(screen=="player" || preservePlayer) && player!=null && playerView!=null && !recovering && !playError
         library.setWatched(data.series.id,false)
         val selectedIndex=index.coerceIn(0,data.episodes.lastIndex)
-        val prefetched=if(position==0L && !recovering) preparedNext.take("${data.episodes[selectedIndex]}:${effectiveQuality()}") else null
-        val claimedHttp=if(prefetched!=null) prefetchHttp.also { prefetchHttp=null } else null
+        val requestedId=data.episodes[selectedIndex]
+        // 换集即重置本集状态（自动降档重放同集时保留 probeQuality，靠 downgradeEpisode 挡住）
+        if(requestedId!=downgradeEpisode) { downgradeEpisode=requestedId; downgradeCount=0; probeQuality=null; failedTiers.clear(); decodeRetried=false }
+        val seriesId=data.series.id
+        var maxQuality=startQuality()
+        // 每 5 集向上探一档：剧内记忆会把起播档锁在「曾经播通」的档位上，但片源编码档位逐集不同
+        // （有的集 1080 解不了、有的集其实能解）。偶发抬高一级试探，失败由自动降档拉回。
+        if(sessionQuality==null && probeQuality==null && !recovering) {
+            val verified=verifiedQuality[seriesId]
+            if(verified!=null && verified>0 && verified<library.maxQuality) {
+                val count=(probeUp[seriesId]?:0)+1
+                if(count>=5) {
+                    probeUp[seriesId]=0
+                    val up=repository.cachedLadder(requestedId)
+                        ?.filter { it.codec!="bytevc2" && it.qNum>verified && it.qNum<=library.maxQuality }
+                        ?.minOfOrNull { it.qNum }
+                    if(up!=null && up>verified) {
+                        maxQuality=up
+                        android.util.Log.i("HongguoTV","Probe up episode=${selectedIndex+1} from ${verified}P to ${up}P")
+                    }
+                } else probeUp[seriesId]=count
+            }
+        }
+        val prefetched=if(position==0L && !recovering) preparedNext.take("$requestedId:$maxQuality") else null
+        // 换剧专用：预取阶段已经把下一部首集连首块都拉好了（recommendVideos，10 分钟 TTL）
+        val readyVideo=recommendVideos.remove(requestedId)?.let { cached ->
+            if(android.os.SystemClock.elapsedRealtime()-cached.first<10*60_000L) cached.second
+            else { runCatching { cached.second.close() }; null }
+        }
+        // 队列附着：把备好的流直接挂进现有播放器队列再 seek 过去，解码器不重建。
+        // 实测（TCL，2026-11-23）：stop+clear 重建换剧首帧 2.9 秒；剧内无缝切集（同为队列切换）
+        // 只要 155ms——差距全在解码器重建上。挂载路径对齐 seamlessNext。
+        val queueAttach=readyVideo!=null && reuse && player!=null && !vc2Active && !recovering
+        if(!queueAttach && prefetched!=null && readyVideo!=null) {
+            // 下一集预挂的流优先级更高：把换剧预取的连接就地还回去，别白占一个
+            runCatching { readyVideo.close() }
+        }
+        if(queueAttach && prefetched!=null) {
+            // 换剧以换剧预取为准：预取的下一集就地回收
+            runCatching { prefetched.close() }
+            closeTransport(prefetchHttp); prefetchHttp=null
+        }
+        val claimedHttp=if(prefetched!=null && !queueAttach) prefetchHttp.also { prefetchHttp=null } else null
         saveProgress(); library.flush(); invalidatePage(); favoriteMonitor.stop(); releaseCatalogViews(); stopDanmaku()
+        // 旧集的流先记下来：队列附着路径要等新集挂上、旧 item 摘掉之后再关（见挂载处）
+        val outgoingVideo=if(reuse) video else null
         if(reuse) {
             cancelRecovery(); cancelPrefetch(); tvTools.close()
             // 自由刷剧用纯色底（用户 2026-11-18：不要海报当背景），换剧时不必换底
             episodePanel?.dismiss(); episodePanel=null; speedDialog?.dismiss(); speedDialog=null
             playerListener?.let { player?.removeListener(it) }; playerListener=null
-            // 保留 stop+clear：实测不 stop（直接 setMediaSource 替换）并不能复用硬解，
-            // 首帧时间几乎没变化（1199ms vs 1166ms），反而有旧音轨残留风险。
-            // 真正的快路径是 seamlessNext()——下一集预挂好时根本不走这里。
-            if(!preservePlayer) { player?.stop(); player?.clearMediaItems() }
+            // 队列附着时不 stop/clear（解码器保住），旧集的流也还托着屏幕上这帧：
+            // 先不关，等新集挂上、旧 item 摘掉之后再收（见下方 queueAttach 挂载处）。
+            if(!queueAttach && !preservePlayer) { player?.stop(); player?.clearMediaItems() }
             video?.let { android.util.Log.w("HongguoTV","Prefetch episode=${episodeIndex+1} ${it.stats()}") }
-            video?.close(); video=null; closeTransport(playbackHttp); playbackHttp=null
+            if(!queueAttach) outgoingVideo?.close()
+            video=null; closeTransport(playbackHttp); playbackHttp=null
+            teardownVc2(); vc2Failed=false
             main.removeCallbacks(hideHud); main.removeCallbacks(seekRunnable); pendingSeek=null
         } else releasePlayer()
         artwork.cancelPage(clearMemory=true)
@@ -4239,30 +4574,50 @@ class MainActivity: Activity() {
         if(reuse && hud.visibility==View.VISIBLE) { panel=false; controls.visibility=View.GONE; controls.clearFocus() } else hidePlaybackOverlay()
         controls.removeAllViews(); controls.visibility=View.GONE; recoverySpinner?.visibility=View.GONE; transportPlay=null; sleepButton=null
         syncMediaSession()
-        val requestedId=data.episodes[episodeIndex]; val maxQuality=effectiveQuality(); val ticket=generation
-        // 每集最多自动降两档，换集后重新计数，避免一集失败就把整部剧拖到最低画质。
-        if(requestedId!=downgradeEpisode) { downgradeEpisode=requestedId; downgradeCount=0 }
+        val ticket=generation
         // 推荐 feed 预取过首集地址就直接用（10 分钟 TTL，地址带时效）
         val warmStream=recommendStreams[requestedId]
             ?.takeIf { android.os.SystemClock.elapsedRealtime()-it.first<10*60*1000L }?.second
-        // 换剧专用：预取阶段已经把首块拉好了，这里直接拿来用，不再现场下载（真机实测省 500~900ms）
-        val readyVideo=recommendVideos.remove(requestedId)?.let { cached ->
-            if(android.os.SystemClock.elapsedRealtime()-cached.first<10*60*1000L) cached.second
-            else { runCatching { cached.second.close() }; null }
-        }
-        // 下一集预挂好的流优先级最高；两条都命中时把预取的视频连接还回去，别白占一个
-        if(prefetched!=null && readyVideo!=null) runCatching { readyVideo.close() }
+        // readyVideo 已在函数开头取好（queueAttach 判定要用）；这里只合并两条预取路径
         val preparedSource=prefetched ?: readyVideo
-        work({ preparedSource ?: RemoteVideo(repository.http,warmStream ?: repository.stream(requestedId,maxQuality)).prepare() }, { remote ->
+        work({
+            preparedSource ?: run {
+                // 推荐流预热的直链先试一次，打不开就走完整阶梯（普通档高→低 + bvc2 垫底）。
+                val warm=warmStream
+                if(warm!=null) {
+                    try { return@run RemoteVideo(repository.http,warm).prepare() }
+                    catch(_: java.io.IOException) { /* 掉到阶梯流程 */ }
+                }
+                // 清晰度阶梯（core 缓存 ~1h）：服务端一次下发全档，普通档从最高（≤用户所选）逐档
+                // prepare，打不开自动换下一档；普通档耗尽再落 bytevc2 垫底档——纯本地换直链，
+                // 不再触发「降级重试」接口闪屏（2026-11-21 真机 403 混发问题由此根治）。
+                try { prepareFromLadder(repository,requestedId,maxQuality,skipFailed=true) }
+                catch(e: UnplayableVideoException) { throw e }
+                catch(e: java.io.IOException) {
+                    // 阶梯全失败：退回旧的 stream() 多轮重试路径兜底（含风控/降级模型场景）。
+                    val stream=repository.stream(requestedId,maxQuality)
+                    if(stream.codec=="bytevc2") vc2Episodes+=requestedId
+                    RemoteVideo(repository.http,stream).prepare()
+                }
+            }
+        }, { remote ->
             android.util.Log.w("HongguoTV","Playback timing episode=${episodeIndex+1} toRemote=${android.os.SystemClock.elapsedRealtime()-playbackStarted}ms preloaded=${prefetched!=null} warmVideo=${readyVideo!=null} reused=$reuse")
             video=remote; quality=remote.info.quality
-            val p=player ?: run {
-                val load=DefaultLoadControl.Builder().setBufferDurationsMs(20000,50000,1000,5000).setTargetBufferBytes(32*1024*1024).build()
-                val renderers=androidx.media3.exoplayer.DefaultRenderersFactory(this).setEnableDecoderFallback(true)
-                ExoPlayer.Builder(this,renderers).setLoadControl(load).build().also {
-                    player=it; playerView?.player=it
-                    it.setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(),true)
-                    it.setHandleAudioBecomingNoisy(true)
+            // 预取/复用路径没经过 prepareFromLadder：这里统一把档位状态对齐，失败降档才有的放矢。
+            if(activeTier==null) activeTier=remote.info
+            if(activeTiers.isEmpty()) activeTiers=repository.cachedLadder(requestedId) ?: listOf(remote.info)
+            val p=player ?: createPlayer()
+            // 软解性能兜底（老电视）：bvc2 软解跟不上会卡顿但永不报错，降档链收不到信号；
+            // 渲染器看门狗持续落后时回调这里，把当前档位记入死档走既有降档链（用户 2026-11-21）。
+            Vc2.api.onVideoTooSlow = { w,h ->
+                android.util.Log.w("HongguoTV","Bvc2 soft decode too slow ${w}x${h}, auto downgrade")
+                main.post {
+                    if(screen=="player" && playbackReady && !playError) {
+                        activeTier?.let { failedTiers+=tierKey(it) }
+                        val lower=nextDescentTarget()
+                        if(lower!=null) applySessionDowngrade(lower)
+                        else android.util.Log.w("HongguoTV","Slow bvc2 decode but no lower tier, keep best effort")
+                    }
                 }
             }
             p.setPlaybackSpeed(effectiveSpeed())
@@ -4270,7 +4625,8 @@ class MainActivity: Activity() {
             val listener=object: Player.Listener {
                 private fun active()=player===p && generation==ticket
                 private fun markReady() {
-                    if(!p.currentTracks.isTypeSelected(C.TRACK_TYPE_VIDEO)) {
+                    // vc2 原生软解模式：视频轨本来就不走 ExoPlayer（原生解码器画），音轨就绪即算就绪。
+                    if(!vc2Active && !p.currentTracks.isTypeSelected(C.TRACK_TYPE_VIDEO)) {
                         playerFailure(PlaybackException("资源没有可解码的视频轨道",null,PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED))
                         return
                     }
@@ -4278,6 +4634,9 @@ class MainActivity: Activity() {
                     if(firstReady) {
                         firstReady=false; readySince=android.os.SystemClock.elapsedRealtime()
                         android.util.Log.w("HongguoTV","Playback ready episode=${episodeIndex+1} preloaded=${prefetched!=null} reused=$reuse elapsedMs=${readySince-episodeStartedAt}")
+                        lastThrottleWait=0; decodeRetried=false
+                        // 记录剧内已验证可播档（仅普通档）：同剧后续集直接从这档起播，不必重复撞硬解失败
+                        activeTier?.takeIf { it.codec!="bytevc2" && it.qNum>0 }?.let { verifiedQuality[seriesId]=it.qNum }
                         startDanmaku()
                         warmEpisodeWindow()
                         // 起播成功后再预取后两部：此刻网络与解码器都已就绪，抢跑不会拖慢当前这部
@@ -4336,6 +4695,9 @@ class MainActivity: Activity() {
                     val oldVideo=video; val oldHttp=playbackHttp
                     episodeIndex=queuedIndex.coerceIn(0,data.episodes.lastIndex); group=episodeIndex/20
                     video=nextVideo; playbackHttp=nextHttp; quality=nextVideo?.info?.quality.orEmpty()
+                    // 档位阶梯状态跟着交接：失败自动降档在预挂的下一集上同样有效。
+                    activeTier=nextVideo?.info
+                    activeTiers=repository.cachedLadder(nextId) ?: listOfNotNull(nextVideo?.info)
                     queuedNextId=""; queuedIndex=-1; queuedVideo=null; queuedHttp=null; queuedFromIndex=-1; queuedFromDuration=0
                     if(p.currentMediaItemIndex>0) runCatching { p.removeMediaItem(0) }
                     stopDanmaku()
@@ -4381,11 +4743,22 @@ class MainActivity: Activity() {
                 override fun onPlayerError(error: PlaybackException) { if(active()) playerFailure(error) }
             }
             playerListener=listener; p.addListener(listener)
-            val source=ProgressiveMediaSource.Factory { VideoDataSource(remote) }.createMediaSource(MediaItem.Builder().setMediaId(requestedId).setUri("hongguotv://episode/$requestedId").setMimeType(MimeTypes.VIDEO_MP4).build())
+            val source=mediaSourceFor(remote,requestedId)
             val introSkip=if(position<=0 && (skipMark?.introSeconds ?: 0)>0) skipMark!!.introSeconds*1000L else position.coerceAtLeast(0)
-            p.setMediaSource(source); p.seekTo(introSkip)
-            android.util.Log.w("HongguoTV","Playback timing episode=${episodeIndex+1} toPrepare=${android.os.SystemClock.elapsedRealtime()-playbackStarted}ms")
-            p.prepare(); p.playWhenReady=foreground && requestedAutoplay && !pausedForLifecycle && episodePanel==null
+            if(queueAttach) {
+                // 队列附着（对齐 seamlessNext）：新集挂到现有播放器尾部再 seek 过去，
+                // 解码器不重建——换剧首帧从 2.9 秒降到百毫秒级。旧集的 item 摘掉后再回收。
+                val at=p.mediaItemCount
+                p.addMediaSource(source); p.seekTo(at,introSkip)
+                if(at>0) p.removeMediaItem(0)
+                main.post { runCatching { outgoingVideo?.close() } }
+                android.util.Log.w("HongguoTV","Playback queue-attach episode=${episodeIndex+1} oldItems=$at")
+            } else {
+                p.setMediaSource(source); p.seekTo(introSkip)
+            }
+            android.util.Log.w("HongguoTV","Playback timing episode=${episodeIndex+1} toPrepare=${android.os.SystemClock.elapsedRealtime()-playbackStarted}ms attached=$queueAttach")
+            if(!queueAttach || p.playbackState==Player.STATE_IDLE || p.playbackState==Player.STATE_ENDED) p.prepare()
+            p.playWhenReady=foreground && requestedAutoplay && !pausedForLifecycle && episodePanel==null
             if(introSkip>0 && position<=0) Toast.makeText(this,"已跳过片头 ${skipMark!!.introSeconds} 秒",Toast.LENGTH_SHORT).show()
         }, { problem -> playerFailure(problem) })
     }
@@ -4395,11 +4768,18 @@ class MainActivity: Activity() {
         networkCleanup.execute { http.dispatcher.cancelAll(); http.connectionPool.evictAll(); http.dispatcher.executorService.shutdown() }
     }
     private fun cancelPrefetch() {
+        cancelNextPrefetch()
+        cancelWarm()
+        dropQueuedNext()
+    }
+    /** 只收掉「下一集」这条预取，不动整窗预热。
+     *  2026-11-23：maybePrefetch() 原来调的是 cancelPrefetch()，而它内部会 cancelWarm()，
+     *  于是每次预取下一集都把 warmWindow 清空 → 下一次 warmEpisodeWindow() 又整窗重打一遍批量请求。
+     *  电视日志里 `window warmed 1/15` 每 5 秒出现一次就是这么来的（整窗预热被反复重启）。 */
+    private fun cancelNextPrefetch() {
         prefetchScope?.cancel(); prefetchScope=null
         preparedNext.clear(); prefetchJob?.cancel(true); prefetchJob=null
         closeTransport(prefetchHttp); prefetchHttp=null; prefetchedFor=""
-        cancelWarm()
-        dropQueuedNext()
     }
     /** 播放就绪后预热当前集前后的一窗（最多 15 集）：之后切集直接命中缓存，不再走「取址失败→自动重试」。 */
     private fun warmEpisodeWindow() {
@@ -4447,7 +4827,7 @@ class MainActivity: Activity() {
         if(!foreground || !p.isPlaying || !library.autoNext || sleepStopped || pausedForLifecycle || episodePanel!=null) return
         if(episodeIndex>=data.episodes.lastIndex) return
         if(data.episodes[episodeIndex]!=p.currentMediaItem?.mediaId || data.episodes[episodeIndex+1]!=id) return
-        if(effectiveQuality()!=quality) return
+        if(startQuality()!=quality) return
         val state=p.playbackState
         if(state==Player.STATE_IDLE || state==Player.STATE_ENDED) return
         // 预取一就绪就挂进播放列表（不再等片尾 30 秒）：
@@ -4459,7 +4839,7 @@ class MainActivity: Activity() {
         val http=prefetchHttp.also { prefetchHttp=null } ?: run { remote.close(); return }
         prefetchedFor=""
         val mediaId=id
-        val source=ProgressiveMediaSource.Factory { VideoDataSource(remote) }.createMediaSource(MediaItem.Builder().setMediaId(mediaId).setUri("hongguotv://episode/$mediaId").setMimeType(MimeTypes.VIDEO_MP4).build())
+        val source=mediaSourceFor(remote,mediaId)
         p.addMediaSource(source)
         queuedNextId=mediaId; queuedIndex=episodeIndex+1; queuedVideo=remote; queuedHttp=http
         queuedFromIndex=episodeIndex; queuedFromDuration=p.duration.coerceAtLeast(0)
@@ -4472,14 +4852,14 @@ class MainActivity: Activity() {
         // 预取时机：不再等片尾 30 秒（用户 2026-11-20：手动换集/上下换剧基本都发生在片子中段，
         // 原来那个窗口等于永远不预取，日志里 preloaded 全是 false）。现在起播稳定 3 秒就开始备下一集，
         // 用户随时按 →/↓ 都能直接接手已经建好连接、解好头部的流。
-        val id=data.episodes[episodeIndex+1]; val quality=effectiveQuality(); val key="$id:$quality"
+        val id=data.episodes[episodeIndex+1]; val quality=startQuality(); val key="$id:$quality"
         if(preparedNext.isFresh(key)) { handOffPrefetched(key,id,quality); return }
         if(prefetchJob?.isDone==false) return
         val now=android.os.SystemClock.elapsedRealtime()
         // 缓冲余量门槛从 5 秒提高到 10 秒：提前预取会拉走一块带宽，慢网上别把当前集的口粮抢走。
         if(readySince==0L || now-readySince<3000 || p.bufferedPosition-p.currentPosition<10_000) return
         if(prefetchAttempts>=3 || (prefetchAttempts>0 && now-prefetchAttemptAt<15_000) || connectivity.isActiveNetworkMetered || !networkAvailable()) return
-        cancelPrefetch(); prefetchedFor=key; prefetchAttemptAt=now; prefetchAttempts++
+        cancelNextPrefetch(); prefetchedFor=key; prefetchAttemptAt=now; prefetchAttempts++
         val ticket=preparedNext.begin(key)
         // 记住播放身份的匿名 Cookie 罐必须继承，否则预加载与正式播放不是同一个会话。
         val http=repository.http.newBuilder().connectTimeout(8,java.util.concurrent.TimeUnit.SECONDS).readTimeout(15,java.util.concurrent.TimeUnit.SECONDS).callTimeout(20,java.util.concurrent.TimeUnit.SECONDS).build()
@@ -4487,23 +4867,24 @@ class MainActivity: Activity() {
         val source=repository.childTransport(http); prefetchHttp=http
         val scope=RequestScope(); prefetchScope=scope
         prefetchJob=prefetchWorker.submit {
-            var remote: RemoteVideo?=null
+            var prepared: RemoteVideo?=null
             try {
-                val prepared=scope.run {
-                    // 取址内部已经在首轮空体时立刻换匿名设备自愈（fetchVideoModel），
-                    // 这里不必再套一层 try/catch 重试——否则会连续注册两台设备，
-                    // 浪费且可能撞站方限流。失败就让 maybePrefetch 的退避机制兜底。
-                    val info=source.stream(id,quality)
+                prepared=scope.run {
+                    // 空响应不 trip 全局冷却（quiet）：预取只是优化，不能替用户把冷却等级抬上去
+                    //（2026-11-23 实测：刷剧时下一集预取被拒，冷却 20→60→120 连跳，看片中途被锁）。
+                    // 失败就让 maybePrefetch 的退避机制兜底，用户真点到下一集时再正式取址。
+                    // 预取与正式播放共用同一套清晰度阶梯（core 缓存 ~1h，取址通常 0 次），
+                    // 普通 403 档会自动换下一档；track=false 不写降级状态，别污染正在播的这集。
+                    prepareFromLadder(source,id,quality,http=http,track=false,quiet=true)
                     // 只 prepare（解析头部 + 常驻首块），不 warm 整个 8MB 前读窗口：
                     // 提前预取发生在正片还在播的时候，一口气抢 8MB 会让慢网直接卡顿。
                     // 真的到片尾要续播时，handOffPrefetched 再补 warm。
-                    RemoteVideo(http,info).also { remote=it; it.prepare() }
                 }
                 if(preparedNext.complete(ticket,key,prepared)) {
                     android.util.Log.i("HongguoTV","Prefetch ready episode=${episodeIndex+2} waited=${android.os.SystemClock.elapsedRealtime()-prefetchAttemptAt}ms")
                     main.post { handOffPrefetched(key,id,quality) }
-                }
-            } catch(_: Exception) { remote?.close() }
+                } else runCatching { prepared?.close() }   // 挂载失败：prepared 无人接手，就地回收
+            } catch(_: Exception) { runCatching { prepared?.close() } }
         }
     }
     private fun networkAvailable(): Boolean {
@@ -4546,20 +4927,194 @@ class MainActivity: Activity() {
     private fun effectiveSpeed(): Float = sessionSpeed ?: library.playbackSpeed
     private fun effectiveFrame(): VideoFrameMode = sessionFrame ?: library.frameMode
     /** 退出播放页时把「只对当前这部剧生效」的临时设置全部丢掉，回到全局默认。 */
-    private fun resetPlaybackSession() { sessionQuality=null; sessionSpeed=null; sessionFrame=null }
-    /** 临时降档只影响本次播放，不写回用户设置，避免一集片源坏了就把全局画质永久拉低。 */
+    private fun resetPlaybackSession() { sessionQuality=null; probeQuality=null; failedTiers.clear(); decodeRetried=false; sessionSpeed=null; sessionFrame=null }
+    /** 临时降档只影响本集重放（probeQuality），不写回用户设置、也不带进下一集——
+     *  下一集起播档由 startQuality() 重新决定（剧内已验证档优先，用户 2026-11-21）。 */
     private fun applySessionDowngrade(target: Int) {
-        sessionQuality=target; downgradeCount++
-        android.util.Log.w("HongguoTV","Auto downgrade to ${target}P episode=${episodeIndex+1} attempt=$downgradeCount actual=$quality")
+        probeQuality=target; downgradeCount++
+        android.util.Log.w("HongguoTV","Auto downgrade to ${if(target==0) "bvc2" else "${target}P"} episode=${episodeIndex+1} attempt=$downgradeCount actual=$quality")
         playEpisode(episodeIndex,retryPosition,retryAutoplay)
     }
+
+    /** 按清晰度阶梯建流：普通档（≤cap）从高到低逐档 prepare，某一档打不开（403/失效）自动换
+     *  下一档，普通档耗尽再落 bytevc2 垫底档（融合路径由 Extractor 嗅探接管）。
+     *  五档全空/解密全失败时 core.ladder 抛 UnplayableVideoException，这里原样上抛。
+     *  track=false 用于预取线程：不写 activeTier/activeTiers，别污染正在播的这集的降级状态。 */
+    private fun prepareFromLadder(repo: ContentRepository,id: String,cap: Int,
+                                  http: okhttp3.OkHttpClient=repository.http,track: Boolean=true,
+                                  skipFailed: Boolean=false,quiet: Boolean=false): RemoteVideo {
+        val tiers=repo.ladder(id,quiet)
+        // skipFailed：同集降档/上爬重放时跳过硬解已失败的档（level 标错类死档），别重复撞；
+        // 预取走 track=false 且默认 false——预取的是下一集，死档名单是本集的，不能跨集套用。
+        val dead={ t: StreamInfo -> skipFailed && tierKey(t) in failedTiers }
+        val normal=tiers.filter { it.codec!="bytevc2" }.sortedByDescending { it.qNum }
+        val selectable=normal.filter { it.qNum in 1..cap && !dead(it) }
+        val normalHead=if(selectable.isEmpty()) normal.filter { !dead(it) }.take(1) else selectable
+        // bvc2 软解档位：受「设置 → 软解清晰度」约束（默认 360P，老电视友好；用户 2026-11-21）。
+        // 在上限内取最高一档（分辨率优先）；上限内全死（性能看门狗标记/URL 失效）时落最低档兜底。
+        val softCap=library.softQuality
+        val bvc=tiers.filter { it.codec=="bytevc2" }.sortedByDescending { it.qNum }
+        val bvcAlive=bvc.filter { !dead(it) }
+        val bvcPick=bvcAlive.filter { it.qNum in 1..softCap }.ifEmpty { bvcAlive.takeLast(1) }
+        val candidates=normalHead+bvcPick
+        if(candidates.isEmpty()) throw UnplayableVideoException("本集片源暂不兼容，请播放下一集","ladder empty id=$id",null)
+        var lastError: java.io.IOException?=null
+        for(tier in candidates) {
+            val remote=RemoteVideo(http,tier)
+            try {
+                if(tier.codec=="bytevc2" && !Vc2.api.fused && !enterVc2Mode(tier))
+                    throw java.io.IOException("vc2 原生解码器不可用")
+                remote.prepare()
+                if(tier.codec=="bytevc2") vc2Episodes+=id
+                if(track) { activeTier=tier; activeTiers=candidates }
+                return remote
+            } catch(e: java.io.IOException) {
+                runCatching { remote.close() }   // prepare 失败的连接必须还回去，别占住缓存块
+                lastError=e
+                android.util.Log.w("HongguoTV","Stream tier failed ${tier.quality}/${tier.codec} ep=$id: ${e.message}")
+            }
+        }
+        throw lastError ?: java.io.IOException("本集无可用片源")
+    }
+    /**
+     * bytevc2 原生软解模式入口（同屏复用主播放页，用户 2026-11-20 拍板）：
+     * - 音轨：ExoPlayer 继续播同一条 bytevc2 流（容器里音频是标准编码），进度/seek/倍速/弹幕时钟全沿用；
+     * - 画面：PlayerView 让位（GONE+摘 player），解码器把视频画到叠加 SurfaceView（mediaOutput 层级盖住空视频面）；
+     * - 下载整集到缓存后打开解码器，视频线程按音频时钟出帧；
+     * - 失败（下载/打开/解码）：置 vc2Failed 后回落「暂不兼容」提示，绝不无限重播。
+     * 返回 false 表示本机不具备原生解码条件，调用方原样抛出走旧逻辑。
+     */
+    private fun enterVc2Mode(vc2: com.hongguotv.core.StreamInfo): Boolean {
+        if(vc2Failed || vc2.url.isEmpty() || vc2.key==null || !Vc2.api.decoderAvailable) return false
+        val url=vc2.url
+        val keyHex=vc2.key!!.joinToString("") { "%02x".format(it) }
+        runOnUiThread {
+            if(screen!="player") return@runOnUiThread
+            teardownVc2()
+            vc2Active=true
+            playerView?.let { it.player=null; it.visibility=View.GONE }
+            val surface=SurfaceView(this).apply {
+                holder.setFormat(PixelFormat.RGBA_8888); setZOrderMediaOverlay(true)
+                holder.addCallback(object: SurfaceHolder.Callback {
+                    override fun surfaceCreated(holder: SurfaceHolder) { vc2Decoder?.setSurface(holder.surface) }
+                    override fun surfaceChanged(holder: SurfaceHolder,format: Int,width: Int,height: Int) { vc2Decoder?.setSurface(holder.surface) }
+                    override fun surfaceDestroyed(holder: SurfaceHolder) { runCatching { vc2Decoder?.setSurface(null) } }
+                })
+            }
+            vc2Surface=surface
+            root.addView(surface,FrameLayout.LayoutParams(-1,-1))
+            updatePlaybackText()
+            Thread {
+                val file=java.io.File(cacheDir,"bvc2_episode.mdl")
+                vc2Cache=file
+                try {
+                    if(file.exists()) file.delete()
+                    val client=okhttp3.OkHttpClient.Builder()
+                        .connectTimeout(20,java.util.concurrent.TimeUnit.SECONDS)
+                        .readTimeout(60,java.util.concurrent.TimeUnit.SECONDS).build()
+                    client.newCall(okhttp3.Request.Builder().url(url)
+                        .header("User-Agent",VendorConstants.VIDEO_UA)
+                        .header("Referer","https://novel.snssdk.com/")
+                        .header("Accept-Encoding","identity").build()).execute().use { resp ->
+                        if(!resp.isSuccessful) throw java.io.IOException("片源下载失败 HTTP ${resp.code}")
+                        java.io.FileOutputStream(file).use { out -> resp.body!!.byteStream().copyTo(out) }
+                    }
+                    android.util.Log.i("HongguoTV","Vc2Mode: downloaded ${file.length()} bytes, opening decoder")
+                    val dec=Vc2.api.openDecoder(file.absolutePath,keyHex) ?: throw java.io.IOException("解码器打开失败")
+                    // 下载期间用户可能已退出播放页（teardownVc2 已跑）：此时解码器没人接手，必须就地释放防泄漏
+                    if(!vc2Active) { runCatching { dec.close() }; return@Thread }
+                    vc2Decoder=dec
+                    main.post {
+                        surface.holder.surface?.takeIf { it.isValid }?.let { dec.setSurface(it) }
+                        startVc2Video(dec)
+                    }
+                } catch(t: Throwable) {
+                    android.util.Log.e("HongguoTV","Vc2Mode: init failed",t)
+                    if(vc2Active) {
+                        vc2Failed=true
+                        main.post {
+                            teardownVc2()
+                            if(screen=="player") playerFailure(com.hongguotv.core.UnplayableVideoException("本集片源暂不兼容，请播放下一集"))
+                        }
+                    }
+                }
+            }.apply { name="bvc2-download" }.start()
+        }
+        return true
+    }
+
+    /** 视频线程：解码出帧后按音频时钟（含倍速）出画；大幅跳转/落后直接吸附到当前位置。 */
+    private fun startVc2Video(dec: Vc2NativeDecoder) {
+        vc2Thread=Thread {
+            while(vc2Active) {
+                val pts=try { dec.decodeVideo() } catch(t: Throwable) {
+                    android.util.Log.e("HongguoTV","bvc2 video decode",t); -1L
+                }
+                if(pts<0) break
+                while(vc2Active) {
+                    val ahead=pts-currentPosition()*1000
+                    if(ahead<=40_000) break
+                    if(ahead>1_500_000) { runCatching { dec.seek(currentPosition().coerceAtLeast(0)*1000) }; break }
+                    try { Thread.sleep(10) } catch(e: InterruptedException) { return@Thread }
+                }
+                if(!vc2Active) break
+                try { dec.renderFrame() } catch(t: Throwable) { android.util.Log.e("HongguoTV","bvc2 render",t) }
+            }
+        }.apply { name="bvc2-video"; start() }
+    }
+
+    /** 拆掉原生软解模式：线程、解码器、叠加画面、缓存文件一并回收，PlayerView 恢复原位。 */
+    private fun teardownVc2() {
+        if(!vc2Active && vc2Thread==null && vc2Decoder==null && vc2Surface==null) return
+        vc2Active=false
+        vc2Thread?.join(1200); vc2Thread=null
+        runCatching { vc2Decoder?.close() }; vc2Decoder=null
+        vc2Surface?.let { runCatching { root.removeView(it) } }; vc2Surface=null
+        runCatching { vc2Cache?.delete() }; vc2Cache=null
+        playerView?.let { it.visibility=View.VISIBLE; it.player=player }
+    }
+
     /** 每集最多自动降两档：解码失败立即降，其余错误等同档重试预算用尽再降。 */
     private fun autoDowngradeTarget(decoding: Boolean,retryable: Boolean): Int? {
-        if(downgradeCount>=2) return null
+        // 上限 5：阶梯最多 5 档普通 + bvc2 垫底，4 次会在最坏情况挡住最后一次 bvc2 软解兜底；
+        // failedTiers 已保证同一档不会重复试，多一次预算不会造成循环空转。
+        if(downgradeCount>=5) return null
         if(!decoding && !(retryable && !recovery.remaining)) return null
-        return QualityDowngrade.next(QualityDowngrade.parse(quality),effectiveQuality())
+        return nextDescentTarget()
+    }
+    /** 沿活动阶梯找下一个可试档位：优先向下（未试过的更低普通档 → bytevc2 垫底返回 0）；
+     *  已到底但上面还有没试过的档时向上爬（用户 2026-11-21）——服务端部分档位 level 标错
+     *  （hvc1.1.6.L186 超硬解能力）不代表整集不能解，高档可能反而是好档。向上封顶
+     *  effectiveQuality()，不突破用户手动选择的档位。返回 null 表示阶梯全试完。 */
+    private fun nextDescentTarget(): Int? {
+        val idx=activeTiers.indexOfFirst { it===activeTier }.takeIf { it>=0 }
+            ?: activeTiers.indexOfFirst { it.quality==activeTier?.quality && it.codec==activeTier?.codec }
+        if(idx<0) return QualityDowngrade.next(QualityDowngrade.parse(quality),effectiveQuality())
+        for(i in idx+1 until activeTiers.size) {
+            val next=activeTiers[i]
+            if(next.codec=="bytevc2") return 0
+            if(tierKey(next) in failedTiers) continue
+            return next.qNum
+        }
+        val ceiling=effectiveQuality()
+        for(i in idx-1 downTo 0) {
+            val up=activeTiers[i]
+            if(tierKey(up) in failedTiers || up.codec=="bytevc2") continue
+            if(up.qNum>ceiling) continue
+            return up.qNum
+        }
+        return null
     }
     private fun playerFailure(problem: Throwable) {
+        // 整集只有 bytevc2（服务端无兼容档）：重播本集，playEpisode 的取流回退会转原生软解模式。
+        // 解码器不可用或本集已失败过就不重试，落回「暂不兼容」提示，防止无限循环。
+        val vc2=(problem as? com.hongguotv.core.UnplayableVideoException)?.bvc2Stream
+        if(vc2!=null && !vc2Failed && vc2.url.isNotEmpty() && vc2.key!=null && Vc2.api.decoderAvailable) {
+            cancelRecovery(); cancelPrefetch(); player?.pause()
+            playEpisode(episodeIndex,currentPosition().coerceAtLeast(0),requestedAutoplay && !sleepStopped,recovering=true)
+            return
+        }
+        teardownVc2()
         // 换集时主动 stop()/close 数据源会让 ExoPlayer 抛出 IOException: Canceled，
         // 这是切换动作本身的副作用，不是片源问题：必须放行，否则过渡层刚盖上去就被撤掉
         //（用户 2026-11-19 真机：过渡层只活了 46ms，画面照样黑）。
@@ -4571,7 +5126,12 @@ class MainActivity: Activity() {
         retryPosition=currentPosition().coerceAtLeast(0); retryAutoplay=requestedAutoplay && !sleepStopped
         saveProgress(); cancelRecovery(); cancelPrefetch()
         // 官方限流（空响应冷却）：记住剩余等待时间，重试改走专用等待路径（见 scheduleRecovery/retryRunnable）。
-        throttledRemainingMs=(problem as? PlaybackThrottledException)?.remainingMs ?: 0L
+        // 连续被拒时官方会逐档加罚且实际封禁窗口长于宣称值，本地等待按上一轮 2 倍退避（2026-11-21 实测）。
+        val throttleRemaining=(problem as? PlaybackThrottledException)?.remainingMs ?: 0L
+        if(throttleRemaining>0) {
+            throttledRemainingMs=maxOf(throttleRemaining,lastThrottleWait*2)
+            lastThrottleWait=throttledRemainingMs
+        } else { throttledRemainingMs=0L; lastThrottleWait=0L }
         val incompatible=problem is UnplayableVideoException
         // 自由刷剧里「片源不兼容」会 2.5 秒后自动跳下一部。这段时间过渡层不要撤：
         // 撤了就是黑底错误页一闪一闪（真机实测就是这样），改成留画面 + 换文案。
@@ -4586,6 +5146,8 @@ class MainActivity: Activity() {
         if(!keepFreeze) hud.visibility=View.VISIBLE
         controls.removeAllViews(); controls.visibility=View.GONE; recoverySpinner?.visibility=View.GONE; panel=true
         val decoding=problem is PlaybackException && problem.errorCode in 3000..4999
+        // 硬解失败的档位记入本集失败名单：降档/上爬时跳过，避免重复撞同一个死档（level 标错类）。
+        if(decoding) activeTier?.let { failedTiers+=tierKey(it) }
         val retryable=!incompatible && (if(problem is PlaybackException) problem.errorCode in 2000..2999 || problem.errorCode==PlaybackException.ERROR_CODE_TIMEOUT else problem is java.io.IOException)
         playbackText.text=when {
             incompatible -> "本集片源暂不兼容：平台未提供电视可解码的清晰度，可播放下一集。"
@@ -4598,10 +5160,21 @@ class MainActivity: Activity() {
         when {
             lower!=null -> {
                 // 自动降档：600ms 后直接换清晰度重放，期间用转圈提示，不打扰用户。
-                playbackText.text="当前清晰度无法播放，正在自动切换到 ${lower}P"
+                playbackText.text=if(lower==0) "当前清晰度无法播放，正在切换到 bvc2 软解画面"
+                    else "当前清晰度无法播放，正在自动切换到 ${lower}P"
                 recoverySpinner?.visibility=View.VISIBLE
                 autoRecovery=false
                 main.postDelayed({ if(foreground && screen=="player" && playError) applySessionDowngrade(lower) },600)
+            }
+            decoding && !decodeRetried -> {
+                // 阶梯耗尽的解码失败：自动重试 1 次赌 CDN 换编码变体（ep39 实测同档不同时刻编码不同）。
+                // 重试必须清死档名单，否则 prepareFromLadder 会跳过原档直接抛「暂不兼容」，碰不到原档；
+                // 重试全程不打取址接口（阶梯缓存内零请求，不撞风控），失败面板照常回来，最坏多花几秒。
+                decodeRetried=true; failedTiers.clear()
+                playbackText.text="正在重试…"
+                recoverySpinner?.visibility=View.VISIBLE
+                autoRecovery=false
+                main.postDelayed({ if(foreground && screen=="player" && playError) playEpisode(episodeIndex,retryPosition,retryAutoplay) },600)
             }
             retryable && !sleepStopped -> {
                 // 可重试：静默自动重试，界面只显示转圈 + 倒计时，不弹按钮。
@@ -4655,11 +5228,11 @@ class MainActivity: Activity() {
             }
         } else {
             addButton(actions,"立即重试") { playEpisode(episodeIndex,retryPosition,retryAutoplay) }.requestFocus()
-            // 手动降一档：档位按当前实际播放档位推算，不再写死 720P。
-            val lower=QualityDowngrade.next(QualityDowngrade.parse(quality),effectiveQuality())
-            if(lower!=null) addButton(actions,"切换到 ${lower}P") {
-                // 只改本次播放的档位，不动用户的全局默认
-                sessionQuality=lower; downgradeCount=0
+            // 手动降一档：沿活动阶梯找当前实际播放档位的下一位，普通档耗尽给 bvc2 兜底入口。
+            val lower=nextDescentTarget()
+            if(lower!=null) addButton(actions,if(lower==0) "切换到 bvc2 软解" else "切换到 ${lower}P") {
+                // 只改本次播放的档位，不动用户的全局默认；用户主动换档=新的尝试，重试预算也复位
+                sessionQuality=lower; downgradeCount=0; decodeRetried=false
                 playEpisode(episodeIndex,retryPosition,retryAutoplay)
             }
             // 已经是 480P（最低档）时上面那个按钮不会出现，但恰恰是这种片源，
@@ -4815,10 +5388,15 @@ class MainActivity: Activity() {
         // 拖动进度条时别用播放位置盖掉「定位到 12:34」：手指还按着，文字每秒跳回去像坏了
         if(progressBar.scrubbing) return
         val danmakuOn=library.danmaku && detail?.series?.id?.let { extras.danmakuEnabled(it,true) }!=false
-        playbackStatus.text=listOfNotNull(quality.ifBlank { null },PlaybackSpeed.label(player?.playbackParameters?.speed ?: effectiveSpeed()),"弹幕 "+(if(danmakuOn) "开" else "关")).joinToString("   ·   ")
+        // bvc2 软解集在清晰度后面标 (软解)，提示用户当前画面来自融合软解（用户 2026-11-21）。
+        // 判断依据是在播档位的 codec（融合路径 vc2Active 恒为 false，原实现拿旧模式标志导致标签永不显示）。
+        val hudQuality=if((vc2Active || activeTier?.codec=="bytevc2") && quality.isNotBlank()) "$quality(软解)" else quality
+        playbackStatus.text=listOfNotNull(hudQuality.ifBlank { null },PlaybackSpeed.label(player?.playbackParameters?.speed ?: effectiveSpeed()),"弹幕 "+(if(danmakuOn) "开" else "关")).joinToString("   ·   ")
         if(sleepStopped) { playbackText.text="定时停止已生效 · 观看位置已保存 · 按播放可继续"; return }
         if(!playbackReady) { playbackText.text=(if(!requestedAutoplay) "准备后保持暂停 · " else "")+if(video==null) "正在获取播放地址…" else "正在缓冲…"; return }
         val p=player ?: return
+        // vc2 模式下解码器还没就绪：音频先行，画面短暂黑屏，状态行给个预期
+        if(vc2Active && vc2Decoder==null) { playbackText.text="正在加载原生解码…"; return }
         val duration=p.duration.coerceAtLeast(0); val position=pendingSeek ?: p.currentPosition
         val state=when { ffActive -> "3× 快进中"; p.playbackState==Player.STATE_BUFFERING -> "缓冲中"; p.playbackState==Player.STATE_ENDED -> "本集已结束"; !p.playWhenReady -> "已暂停"; else -> "正在播放" }
         playbackText.text="$state  ·  ${formatTime(position)} / ${formatTime(duration)}"+(if(sleepTimer.active) "  ·  定时 ${sleepTimer.label()}" else "")
@@ -4849,6 +5427,8 @@ class MainActivity: Activity() {
      */
     private fun seamlessNext(silent: Boolean=false): Boolean {
         if(!seamlessNextOnSkip) return false
+        // vc2 模式：下一集走播放器内部切轨会让原生解码的画面与新集音轨脱节，强制走完整换集路径
+        if(vc2Active) return false
         val p=player ?: return false
         val data=detail ?: return false
         if(screen!="player" || playError || !playbackReady) return false
@@ -5243,7 +5823,7 @@ class MainActivity: Activity() {
             val danmakuOn=extras.danmakuEnabled(seriesId,library.danmaku)
             fun skipLabel(seconds: Int)=if(seconds>0) "$seconds 秒" else "关闭"
             val options=buildList {
-                add("倍速 ${PlaybackSpeed.label(effectiveSpeed())}（仅本剧）"); add("清晰度 ${effectiveQuality()}P（仅本剧）"); add("画面 ${effectiveFrame().label}（仅本剧）"); add("定时 ${sleepTimer.label()}")
+                add("倍速 ${PlaybackSpeed.label(effectiveSpeed())}（仅本剧）"); add("清晰度 ${if(effectiveQuality()>0) "${effectiveQuality()}P" else "bvc2 软解"}（仅本剧）"); add("画面 ${effectiveFrame().label}（仅本剧）"); add("定时 ${sleepTimer.label()}")
                 add("跳过片头 ${skipLabel(mark?.introSeconds ?: 0)}"); add("跳过片尾 ${skipLabel(mark?.outroSeconds ?: 0)}"); add("从头播放"); add("弹幕 ${if(danmakuOn) "开启" else "关闭"}（仅本剧）")
                 if(danmakuOn) add("弹幕设置")
             }
@@ -5298,8 +5878,8 @@ class MainActivity: Activity() {
         columns+=optionColumn("清晰度",PlaybackQuality.options.map { "${it}P" },PlaybackQuality.options.indexOf(effectiveQuality())) { index,_ ->
             val target=PlaybackQuality.options[index]
             if(effectiveQuality()!=target) {
-                // 只改本次播放的档位，不写回全局默认
-                sessionQuality=target; downgradeEpisode=""; downgradeCount=0
+                // 只改本次播放的档位，不写回全局默认；用户主动换档=新的尝试，重试预算也复位
+                sessionQuality=target; probeQuality=null; downgradeEpisode=""; downgradeCount=0; decodeRetried=false
                 playEpisode(episodeIndex,currentPosition(),player?.playWhenReady ?: requestedAutoplay)
             } else showQuickPanel()
         }
@@ -5448,6 +6028,38 @@ class MainActivity: Activity() {
         dialog.show()
         (items.getOrNull(speeds.indexOf(current)) ?: items.firstOrNull())?.requestFocus()
     }
+    /** 软解（bvc2）清晰度选择（用户 2026-11-21）：默认 360P 老电视友好。
+     *  只影响 bvc2 垫底档的选择；调高后软解跟不上，性能看门狗仍会自动降回来。 */
+    private fun showSoftQualityPicker(anchor: TextView) {
+        val options=PlaybackQuality.softOptions
+        val current=library.softQuality
+        val content=column()
+        content.addView(TvDialog.title(this,"软解清晰度"))
+        content.addView(text("bvc2 软解专用档位，普通剧集不受影响。老电视建议 360P；调高画质更好，但软解跟不上会自动降回来。",12f,muted).apply { setPadding(dp(8),0,dp(8),dp(8)) })
+        lateinit var dialog: AlertDialog
+        val items=mutableListOf<TextView>()
+        options.forEach { q ->
+            val isCurrent=q==current
+            val item=button("${q}P"+(if(isCurrent) "   ·   当前" else ""),isCurrent) {
+                library.softQuality=q
+                anchor.text="软解清晰度  ·  ${q}P"
+                dialog.dismiss()
+            }
+            items+=item
+            item.gravity=Gravity.CENTER_VERTICAL
+            item.setPadding(dp(16),dp(10),dp(16),dp(10))
+            content.addView(item,lp(-1,dp(46)).apply { bottomMargin=dp(8) })
+        }
+        items.forEachIndexed { index,view ->
+            view.nextFocusUpId=items.getOrNull(index-1)?.id ?: view.id
+            view.nextFocusDownId=items.getOrNull(index+1)?.id ?: view.id
+        }
+        dialog=AlertDialog.Builder(this).setView(TvDialog.card(this,content)).create()
+        TvDialog.styleWindow(this,dialog,maxWidthDp=380,gravity=Gravity.CENTER,marginDp=48)
+        dialog.setOnDismissListener { if(anchor.isAttachedToWindow) anchor.requestFocus() }
+        dialog.show()
+    }
+
     private fun showQualityPicker(anchor: TextView,inPlayer: Boolean) {
         val options=PlaybackQuality.options
         val current=if(inPlayer) effectiveQuality() else library.maxQuality
@@ -5463,12 +6075,12 @@ class MainActivity: Activity() {
             val item=button("${quality}P"+(if(isCurrent) "   ·   当前" else ""),isCurrent) {
                 if(inPlayer) {
                     // 播放中只切这一部剧的档位，不动用户设置的全局默认
-                    sessionQuality=quality
+                    sessionQuality=quality; probeQuality=null
                 } else {
                     library.maxQuality=quality; sessionQuality=null
                 }
                 // 用户手动选定档位即视为放弃本轮自动降档，后续失败重新从选定档位起算。
-                downgradeEpisode=""; downgradeCount=0
+                downgradeEpisode=""; downgradeCount=0; decodeRetried=false
                 if(anchor.tag!="playback-settings") anchor.text=(if(inPlayer) "清晰度 " else "默认清晰度  ·  ")+"${quality}P"
                 // 选完就收窗：播放中它会挡住画面，而用户下一步要看的是「到底能不能播」。
                 dialog.dismiss()
@@ -5730,6 +6342,7 @@ class MainActivity: Activity() {
     }
     private fun releasePlayer() {
         cancelRecovery(); cancelPrefetch(); mediaSession.deactivate(); tvTools.close()
+        teardownVc2()
         main.removeCallbacks(menuLongRunnable); menuLongFired=false
         ffActive=false; outroSkipSeconds=0; outroTriggered=false
         val wasForeground=foreground; foreground=false
@@ -5828,6 +6441,9 @@ class MainActivity: Activity() {
             "neon" -> { layer.addView(NeonBackdrop(this),FrameLayout.LayoutParams(-1,-1)); addClockOverlay(layer,Color.WHITE,Color.argb(210,180,220,255)) }
             "stars" -> { layer.addView(StarfieldView(this),FrameLayout.LayoutParams(-1,-1)); addClockOverlay(layer,Color.WHITE,Color.argb(210,255,255,255)) }
             "breath" -> { layer.addView(BreathBackdrop(this),FrameLayout.LayoutParams(-1,-1)); addClockOverlay(layer,Color.WHITE,Color.argb(210,255,255,255)) }
+            // 仿真时钟两档：表盘自己就是时钟（指针实时走动），不再叠数字角标，「时钟位置」设置不参与
+            "clockgold" -> layer.addView(AnalogClockView(this,true),FrameLayout.LayoutParams(-1,-1))
+            "clockdawn" -> layer.addView(AnalogClockView(this,false),FrameLayout.LayoutParams(-1,-1))
             "custom" -> screensaverCustom=ScreensaverCustom(layer,onlyFile).also { it.start() }
             else -> addClockOverlay(layer,Color.WHITE,muted)
         }
@@ -5873,15 +6489,55 @@ class MainActivity: Activity() {
         if(screensaverLeft<=0) { dismissScreensaver(); return }
         refreshScreensaverHint()
     }
-    /** 中央时钟（内置风格通用）：样式各不相同但走同一秒级 tick。 */
-    private fun addClockOverlay(layer: FrameLayout,clockColor: Int,dateColor: Int,hint: String?=null) {
-        val clock=text("",54f,clockColor).apply { setTypeface(null,Typeface.BOLD); gravity=Gravity.CENTER; includeFontPadding=false }
-        val date=text("",16f,dateColor).apply { gravity=Gravity.CENTER; setPadding(0,dp(14),0,0) }
-        val box=column().apply { gravity=Gravity.CENTER }
-        box.addView(clock,lp(-1,-2)); box.addView(date,lp(-1,-2))
-        if(hint!=null) box.addView(text(hint,13f,dateColor).apply { gravity=Gravity.CENTER; setPadding(0,dp(18),0,0) },lp(-1,-2))
-        layer.addView(box,FrameLayout.LayoutParams(-1,-1,Gravity.CENTER))
-        screensaverClock=clock; screensaverDate=date
+    /** 屏保时钟：位置完全跟随设置（居中/右上/左下/右下/不显示），内置风格与自定义素材共用一套。
+     *  2026-11-23 修复两点：内置风格以前固定居中、根本不读 screensaverClockPos（设置里换位置预览没变化）；
+     *  位置选项补上「居中」档。返回时钟容器（自定义素材换图后要 bringToFront 顶回最上层），关闭时返回 null。 */
+    private fun addClockOverlay(layer: FrameLayout,clockColor: Int,dateColor: Int,hint: String?=null): View? {
+        val pos=library.screensaverClockPos
+        var box: LinearLayout?=null
+        if(pos!="off") {
+            val corner=pos!="mid"
+            val clock=text("",if(corner) 26f else 54f,clockColor).apply {
+                setTypeface(null,Typeface.BOLD)
+                gravity=if(corner) Gravity.START else Gravity.CENTER
+                includeFontPadding=false
+            }
+            val date=text("",if(corner) 12f else 16f,dateColor).apply {
+                gravity=if(corner) Gravity.START else Gravity.CENTER
+                if(!corner) setPadding(0,dp(14),0,0)
+            }
+            box=column().apply {
+                if(corner) {
+                    gravity=if(pos=="bl") Gravity.START else Gravity.END
+                    background=rounded(Color.argb(64,0,0,0))
+                    setPadding(dp(14),dp(8),dp(14),dp(10))
+                } else gravity=Gravity.CENTER
+                // 自定义素材的图/视频是后加的会盖住时钟，直接抬 Z 轴（与提示条同一个坑）
+                translationZ=dp(20).toFloat()
+            }
+            box.addView(clock,lp(-1,-2)); box.addView(date,lp(-1,-2))
+            val (gravity,wide)=when(pos) {
+                "bl" -> (Gravity.BOTTOM or Gravity.START) to false
+                "br" -> (Gravity.BOTTOM or Gravity.END) to false
+                "tr" -> (Gravity.TOP or Gravity.END) to false
+                else -> Gravity.CENTER to true
+            }
+            layer.addView(box,FrameLayout.LayoutParams(if(wide) -1 else -2,if(wide) -1 else -2,gravity).apply {
+                when(pos) {
+                    "tr" -> setMargins(0,dp(28),dp(36),0)
+                    "bl" -> setMargins(dp(36),0,0,dp(40))
+                    "br" -> setMargins(0,0,dp(36),dp(40))
+                }
+            })
+            screensaverClock=clock; screensaverDate=date
+        }
+        if(hint!=null) {
+            val tip=text(hint,13f,dateColor).apply { gravity=Gravity.CENTER }
+            // 居中时钟时提示挂到时钟下面，避免叠字；其余位置提示居中摆放
+            if(pos=="mid" && box!=null) box.addView(tip,lp(-1,-2))
+            else layer.addView(tip,FrameLayout.LayoutParams(-2,-2,Gravity.CENTER))
+        }
+        return box
     }
     private fun updateScreensaverClock() {
         val now=java.util.Calendar.getInstance()
@@ -6348,6 +7004,8 @@ class MainActivity: Activity() {
             "neon" -> { frame.addView(NeonBackdrop(this),FrameLayout.LayoutParams(-1,-1)); frame.addView(clockLabel,FrameLayout.LayoutParams(-1,-1)) }
             "stars" -> { frame.addView(StarfieldView(this),FrameLayout.LayoutParams(-1,-1)); frame.addView(clockLabel,FrameLayout.LayoutParams(-1,-1)) }
             "breath" -> { frame.addView(BreathBackdrop(this),FrameLayout.LayoutParams(-1,-1)); frame.addView(clockLabel,FrameLayout.LayoutParams(-1,-1)) }
+            "clockgold" -> frame.addView(AnalogClockView(this,true),FrameLayout.LayoutParams(-1,-1))
+            "clockdawn" -> frame.addView(AnalogClockView(this,false),FrameLayout.LayoutParams(-1,-1))
             "custom" -> {
                 frame.setBackgroundColor(Color.argb(255,16,20,30))
                 val all=saverMediaFiles()
@@ -6371,7 +7029,7 @@ class MainActivity: Activity() {
     private fun showSaverStylePicker(anchor: TextView) {
         val content=column()
         content.addView(TvDialog.title(this,"选择屏保画面"))
-        content.addView(text("左右键浏览，确认键选用。前四种是自带画面；「我的素材」放你自己传的图片和视频。",13f,muted).apply { setPadding(0,dp(4),0,dp(10)) })
+        content.addView(text("左右键浏览，确认键选用。前六种是自带画面（含两款指针走动的仿真时钟）；「我的素材」放你自己传的图片和视频。",13f,muted).apply { setPadding(0,dp(4),0,dp(10)) })
         val scroll=HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled=false; isFillViewport=false }
         val row=LinearLayout(this).apply { orientation=LinearLayout.HORIZONTAL; gravity=Gravity.CENTER_VERTICAL; setPadding(dp(8),0,dp(8),dp(4)) }
         val index=ScreenSaverPrefs.STYLES.indexOfFirst { it.first==library.screensaverStyle }.coerceAtLeast(0)
@@ -6477,6 +7135,96 @@ class MainActivity: Activity() {
         }
     }
 
+    /** 仿真时钟（用户 2026-11-23）：指针实时走动的自绘表盘，整屏做底、表盘居中，日期画在表盘下方。
+     *  两档配色：gold=墨金（暗底 + 金圈金针），否则晨白（晨光底 + 素白表盘 + 深色指针）。
+     *  表盘本身就是时钟，这两档不再叠数字时钟角标（「时钟位置」设置对它们不生效）。 */
+    private class AnalogClockView(ctx: Context,private val gold: Boolean): View(ctx) {
+        private val paint=Paint(Paint.ANTI_ALIAS_FLAG)
+        private val calendar=java.util.Calendar.getInstance()
+        override fun onDraw(canvas: Canvas) {
+            val w=width.toFloat(); val h=height.toFloat(); val d=resources.displayMetrics.density
+            // 整屏底：中央微亮、四周收暗的径向渐变，避免大黑屏中间孤零零一个表盘的呆板
+            paint.style=Paint.Style.FILL
+            paint.shader=RadialGradient(w/2f,h/2f,Math.max(w,h)*0.72f,
+                intArrayOf(if(gold) Color.argb(255,40,46,62) else Color.argb(255,70,80,108), if(gold) Color.BLACK else Color.argb(255,20,23,32)),
+                floatArrayOf(0f,1f),android.graphics.Shader.TileMode.CLAMP)
+            canvas.drawRect(0f,0f,w,h,paint)
+            paint.shader=null
+            val cx=w/2f; val cy=h/2f
+            val r=Math.min(w,h)*0.32f
+            val goldLine=Color.argb(255,214,182,108)
+            val goldBright=Color.argb(255,236,210,148)
+            val darkInk=Color.argb(255,44,50,66)
+            // 表盘面 + 外圈
+            paint.color=if(gold) Color.argb(255,32,38,52) else Color.argb(255,242,238,229)
+            canvas.drawCircle(cx,cy,r,paint)
+            paint.style=Paint.Style.STROKE
+            paint.strokeWidth=3.5f*d
+            paint.color=if(gold) goldLine else Color.argb(255,124,132,152)
+            canvas.drawCircle(cx,cy,r,paint)
+            paint.strokeWidth=1f*d
+            paint.color=if(gold) Color.argb(150,214,182,108) else Color.argb(150,124,132,152)
+            canvas.drawCircle(cx,cy,r*0.90f,paint)
+            // 刻度：12 个主刻度粗而亮，分钟刻度细而淡
+            for(i in 0 until 60) {
+                val major=i%5==0
+                val angle=Math.toRadians((i*6-90).toDouble())
+                val sin=Math.sin(angle).toFloat(); val cos=Math.cos(angle).toFloat()
+                paint.strokeWidth=(if(major) 3.5f else 1.2f)*d
+                paint.color=when { gold&&major -> goldBright; gold -> Color.argb(130,180,160,110); major -> darkInk; else -> Color.argb(120,100,108,130) }
+                val inner=r*(if(major) 0.74f else 0.82f); val outer=r*0.86f
+                canvas.drawLine(cx+cos*inner,cy+sin*inner,cx+cos*outer,cy+sin*outer,paint)
+            }
+            // 数字 12 / 3 / 6 / 9
+            paint.style=Paint.Style.FILL
+            paint.textSize=r*0.16f
+            paint.textAlign=Paint.Align.CENTER
+            paint.typeface=Typeface.create("sans-serif-light",Typeface.BOLD)
+            paint.color=if(gold) goldBright else darkInk
+            val nr=r*0.60f
+            val asc=paint.fontMetrics.ascent; val desc=paint.fontMetrics.descent
+            fun vText(value: String,x: Float,y: Float)=canvas.drawText(value,x,y-(asc+desc)/2f,paint)
+            vText("12",cx,cy-nr)
+            vText("6",cx,cy+nr)
+            paint.textAlign=Paint.Align.LEFT
+            vText("3",cx+nr-paint.measureText("3")/2f,cy)
+            paint.textAlign=Paint.Align.RIGHT
+            vText("9",cx-nr+paint.measureText("9")/2f,cy)
+            // 指针：时针 / 分针常亮，秒针细一档、配色做区分
+            calendar.timeInMillis=System.currentTimeMillis()
+            val hour=calendar.get(java.util.Calendar.HOUR)+calendar.get(java.util.Calendar.MINUTE)/60f
+            val minute=calendar.get(java.util.Calendar.MINUTE)+calendar.get(java.util.Calendar.SECOND)/60f
+            val second=calendar.get(java.util.Calendar.SECOND)+calendar.get(java.util.Calendar.MILLISECOND)/1000f
+            fun hand(angleDeg: Float,length: Float,width: Float,color: Int) {
+                val angle=Math.toRadians((angleDeg-90).toDouble())
+                paint.style=Paint.Style.STROKE
+                paint.strokeWidth=width*d
+                paint.strokeCap=Paint.Cap.ROUND
+                paint.color=color
+                canvas.drawLine(cx,cy,cx+Math.sin(angle).toFloat()*length,cy-Math.cos(angle).toFloat()*length,paint)
+            }
+            hand(hour*30f,r*0.48f,6f,if(gold) goldBright else darkInk)
+            hand(minute*6f,r*0.70f,4f,if(gold) goldBright else darkInk)
+            hand(second*6f,r*0.78f,1.6f,if(gold) Color.argb(255,220,128,104) else Color.argb(255,198,94,86))
+            paint.style=Paint.Style.FILL
+            paint.color=if(gold) goldBright else darkInk
+            canvas.drawCircle(cx,cy,4f*d,paint)
+            // 表盘下方：日期与星期，两档共用
+            paint.textSize=r*0.11f
+            paint.textAlign=Paint.Align.CENTER
+            paint.typeface=Typeface.create("sans-serif",Typeface.NORMAL)
+            paint.color=if(gold) Color.argb(210,222,198,140) else Color.argb(210,226,232,248)
+            val week=when(calendar.get(java.util.Calendar.DAY_OF_WEEK)) {
+                java.util.Calendar.MONDAY -> "周一"; java.util.Calendar.TUESDAY -> "周二"; java.util.Calendar.WEDNESDAY -> "周三"
+                java.util.Calendar.THURSDAY -> "周四"; java.util.Calendar.FRIDAY -> "周五"; java.util.Calendar.SATURDAY -> "周六"
+                else -> "周日"
+            }
+            canvas.drawText("${calendar.get(java.util.Calendar.MONTH)+1}月${calendar.get(java.util.Calendar.DAY_OF_MONTH)}日  ·  $week",cx,cy+r*1.22f,paint)
+            // 250ms 一帧：秒针连续扫动不跳格，CPU 占用也远低于逐帧
+            postInvalidateDelayed(250)
+        }
+    }
+
     /** 自定义媒体屏保：轮播勾选的图片/动图/视频，间隔与声音、填充方式、角标位置都跟随设置。 */
     private inner class ScreensaverCustom(private val layer: FrameLayout,private val only: java.io.File?=null) {
         private var player: MediaPlayer?=null
@@ -6514,26 +7262,9 @@ class MainActivity: Activity() {
             addCornerClock()
             playAt(pool,index)
         }
-        /** 角标时钟：位置跟随设置（右上/左下/右下/不显示），加一层很浅暗底，满幅明亮壁纸上白字也能看清。 */
+        /** 时钟：位置跟随设置（居中/右上/左下/右下/不显示），与内置风格共用 addClockOverlay。 */
         private fun addCornerClock() {
-            val pos=library.screensaverClockPos
-            if(pos=="off") return
-            val clock=text("",26f,Color.argb(235,255,255,255)).apply { setTypeface(null,Typeface.BOLD) }
-            val date=text("",12f,Color.argb(190,255,255,255))
-            val corner=column().apply {
-                gravity=if(pos=="bl") Gravity.START else Gravity.END
-                background=rounded(Color.argb(64,0,0,0))
-                setPadding(dp(14),dp(8),dp(14),dp(10))
-            }
-            corner.addView(clock); corner.addView(date)
-            val (gravity,margins)=when(pos) {
-                "bl" -> (Gravity.BOTTOM or Gravity.START) to intArrayOf(dp(36),0,0,dp(40))
-                "br" -> (Gravity.BOTTOM or Gravity.END) to intArrayOf(0,0,dp(36),dp(40))
-                else -> (Gravity.TOP or Gravity.END) to intArrayOf(0,dp(28),dp(36),0)
-            }
-            layer.addView(corner,FrameLayout.LayoutParams(-2,-2,gravity).apply { setMargins(margins[0],margins[1],margins[2],margins[3]) })
-            cornerView=corner
-            screensaverClock=clock; screensaverDate=date
+            cornerView=addClockOverlay(layer,Color.argb(235,255,255,255),Color.argb(190,255,255,255))
         }
         /** 换下一个媒体前先撤掉上一个的 view：否则 GIF/图片/视频互相叠加，角标时钟也会被盖住。 */
         private fun removeMedia() {
@@ -7284,6 +8015,10 @@ class MainActivity: Activity() {
                 true
             }
             "random.pick" -> remoteRandomPick(cmd.arg)
+            // 自由刷剧：已在 feed 里就只回执不再重进（enterFreeFeed 自己有防重入，但回执要区分）
+            "feed.open" -> if(screen=="player" && recommendMode) { voiceSay("已经在自由刷剧了"); true } else { enterFreeFeed(); true }
+            // 屏保预览：立即盖屏看一眼，8 秒自动退出；播放页不响应（会盖住正在看的画面）
+            "saver.preview" -> if(screen=="player") false else { previewScreensaver(); true }
             "resume.latest" -> remoteResumeList().firstOrNull()?.let { remoteResumePlay(it.id) } ?: false
             "list.play" -> listTarget(cmd.arg)?.let { (kind,index) -> remoteListPlay(kind,index) } ?: false
             "favorite.toggle" -> {
@@ -7811,6 +8546,16 @@ class MainActivity: Activity() {
         // 播放屏没有可聚焦的 View（surface + HUD），焦点搜索必然落空，手机上表现成「按了没反应」。
         // 控制条收起时直接对齐实体遥控器的播放屏语义：上呼出设置、下选集、左右快退快进、确认暂停。
         if(screen=="player" && !panel) {
+            // 自由刷剧（用户 2026-11-21）：手机遥控方向键此前硬用点播语义（上设置/下选集/左右快进），
+            // 与实体遥控在 feed 里的键位（↑↓换剧、←→换集、确认暂停）对不上。对齐 handleRecommendKey。
+            if(recommendMode) return when(key) {
+                "center" -> if(playError) true else { togglePlayback(); if(player?.playWhenReady==true) hidePlaybackOverlay() else showHud(); true }
+                "up" -> { switchRecommend(-1); true }
+                "down" -> { switchRecommend(1); true }
+                "left" -> { feedSkipEpisode(-1); true }
+                "right" -> { feedSkipEpisode(1); true }
+                else -> false
+            }
             return when(key) {
                 "center" -> { togglePlayback(); true }
                 "up" -> { showPanel(); true }
@@ -7928,7 +8673,25 @@ class MainActivity: Activity() {
             goBack()
             return true
         }
+        // 鼠标左键点按走 touch 通道而非 generic motion：按住不动只点击时系统只发 touch 事件，
+        // 之前只在右键分支续命，导致「一直用鼠标点着也会进屏保」（用户 2026-11-21）。
+        lastInteractionAt=android.os.SystemClock.elapsedRealtime()
         return super.dispatchTouchEvent(ev)
+    }
+    /** 鼠标滚轮：RecyclerView 原生不吃 GenericMotion 滚轮事件，目录网格此前只能靠遥控方向键
+     *  滚（issue #35.2「鼠标下拉不下去」的一半根因）。滚轮按屏高 1/5 步进滚动结果网格。 */
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if(screen=="catalog" && event.action==MotionEvent.ACTION_SCROLL
+            && event.source and InputDevice.SOURCE_CLASS_POINTER!=0) {
+            val delta=event.getAxisValue(MotionEvent.AXIS_VSCROLL)
+            val recycler=catalogRecycler
+            if(delta!=0f && recycler!=null && recycler.height>0) {
+                pointerInput=true
+                recycler.scrollBy(0,(delta*recycler.height/5f).toInt())
+                return true
+            }
+        }
+        return super.onGenericMotionEvent(event)
     }
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         // 屏保唤醒键只撤屏保不透传：防止「按一下想唤醒却把焦点卡片点开了」（用户 2026-11-19）

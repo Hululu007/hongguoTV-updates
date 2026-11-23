@@ -14,6 +14,11 @@ internal class ProtoBuf {
     private val fields = mutableListOf<Field>()
     private val blobs = mutableListOf<ByteArray>()
     fun putVarint(idx: Int, v: Long): ProtoBuf { fields += Field(idx, 0, v, -1); return this }
+    /** Go `sint`（zigzag）字段。 */
+    fun putSint(idx: Int, v: Long): ProtoBuf = putVarint(idx, (v shl 1) xor (v shr 63))
+    /** zigzag 且不截断到 32 位（passport 的设备时间戳等大数需要）。 */
+    fun putSint64(idx: Int, v: Long): ProtoBuf { fields += Field(idx, 6, (v shl 1) xor (v shr 63), -1); return this }
+    fun putFloat(idx: Int, v: Float): ProtoBuf { fields += Field(idx, 5, java.lang.Float.floatToIntBits(v).toLong(), -1); return this }
     private fun putBlob(idx: Int, data: ByteArray): ProtoBuf { blobs += data; fields += Field(idx, 2, 0, blobs.size - 1); return this }
     fun putUtf8(idx: Int, s: String) = putBlob(idx, s.toByteArray(Charsets.UTF_8))
     fun putBytes(idx: Int, data: ByteArray) = putBlob(idx, data)
@@ -21,10 +26,13 @@ internal class ProtoBuf {
     fun toBuf(): ByteArray {
         val out = ByteArrayOutputStream()
         for (f in fields) {
-            writeVarint(out, (f.tag.toLong() shl 3) or f.type.toLong())
+            // type 6 只是「不截断的 varint」，wire type 仍是 0。
+            writeVarint(out, (f.tag.toLong() shl 3) or (if (f.type == 6) 0L else f.type.toLong()))
             when (f.type) {
                 0 -> writeVarint(out, f.value)
                 2 -> { val b = blobs[f.blobIndex]; writeVarint(out, b.size.toLong()); out.write(b) }
+                5 -> out.write(le32(f.value.toInt()))
+                6 -> { var n = f.value; while (n < 0 || n >= 128) { out.write(((n and 127) or 128).toInt()); n = n ushr 7 }; out.write(n.toInt()) }
             }
         }
         return out.toByteArray()
@@ -373,12 +381,42 @@ internal object PlayerSigner {
         val headers = linkedMapOf(
             "x-ss-req-ticket" to requestTicket.toString(),
             "x-khronos" to ts.toString(),
+            // 真果鉴（Adsryen/zhenguojian）README 实测：取流类请求固定四头
+            // X-Gorgon / X-Khronos / X-Ladon / X-Argus，缺 gorgon 同样会被风控空包。
+            // 算法与 X-Ladon 等绑定同一 (query, body, ts)，见下方 gorgon()。
+            "x-gorgon" to gorgon(query, body, ts),
             "x-ladon" to Ladon.encrypt(ts, LICENSE_ID, aid, ladonRandom),
             "x-argus" to Argus.sign(query, stub, ts, aid, LICENSE_ID, queryParam(query, "device_id").orEmpty(), "", random.nextInt()),
         )
         if (stub.isNotEmpty()) headers["x-ss-stub"] = stub
         return headers
     }
+
+    /**
+     * 取流类 X-Gorgon（26 字节：6 字节版本头 84 04 40 1c 00 00 + 20 字节载荷）。
+     * 载荷 = query MD5 前 4 字节 + body MD5 前 4 字节（无 body 则 0）+ {0,6,11,28} + BE 时间戳，
+     * 先异或固定 20 字节密钥，再逐字节「左旋 4 位 → 与下一字节异或 → 位反转 → ^0xff^20」。
+     * 与 juneix/redguo `signHongguoRequest`、真果鉴四头方案逐字节一致。
+     */
+    private fun gorgon(query: String, body: ByteArray?, ts: Long): String {
+        val payload = ByteArray(20)
+        digest("MD5", query.toByteArray()).copyInto(payload, 0, 0, 4)
+        if (body != null && body.isNotEmpty()) digest("MD5", body).copyInto(payload, 4, 0, 4)
+        payload[13] = 6; payload[14] = 11; payload[15] = 28
+        be32(ts.toInt()).copyInto(payload, 16)
+        for (i in payload.indices) payload[i] = (payload[i].u() xor GORGON_KEY[i].u()).toByte()
+        for (j in payload.indices) {
+            val rotated = ((payload[j].u() shl 4) or (payload[j].u() ushr 4)) and 255
+            val mixed = rotated xor payload[(j + 1) % payload.size].u()
+            payload[j] = ((java.lang.Integer.reverse(mixed) ushr 24) xor 0xFF xor payload.size).toByte()
+        }
+        return (byteArrayOf(0x84.toByte(), 0x04, 0x40, 0x1c.toByte(), 0, 0) + payload).hex()
+    }
+    private val GORGON_KEY = byteArrayOf(
+        0x44.toByte(), 0xb9.toByte(), 0xb9.toByte(), 0xd9.toByte(), 0xa4.toByte(), 0xae.toByte(), 0xf9.toByte(), 0xfc.toByte(),
+        0xa4.toByte(), 0x93.toByte(), 0xaa.toByte(), 0x75.toByte(), 0x7c.toByte(), 0xa3.toByte(), 0xc2.toByte(), 0xc4.toByte(),
+        0xa4.toByte(), 0x96.toByte(), 0x93.toByte(), 0x8f.toByte(),
+    )
     /** Same headers plus the legacy gorgon used only while a device registers. */
     fun registrationHeaders(query: String, body: ByteArray?, ts: Long = System.currentTimeMillis() / 1000): Map<String, String> {
         val headers = LinkedHashMap(headers(query, body, ts))

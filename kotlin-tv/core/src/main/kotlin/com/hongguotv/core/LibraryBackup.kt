@@ -12,26 +12,39 @@ data class BackupSettings(val quality: Int=1080,val speed: Float=1f,val autoNext
     val danmakuOpacity: Int=DanmakuPrefs.OPACITY_DEFAULT,val danmakuFont: Int=DanmakuPrefs.FONT_DEFAULT,val danmakuSpeed: Int=DanmakuPrefs.SPEED_DEFAULT,val danmakuRows: Int=DanmakuPrefs.ROWS_DEFAULT,
     val showClock: Boolean=true,val sourceHidden: Boolean=true,val navHidden: Set<String> = setOf("nas"),val feedAutoSwipe: Boolean=false,
     val screensaverMinutes: Int=0,val screensaverStyle: String="classic",val screensaverMuted: Boolean=false,val screensaverMedia: String="",
-    val screensaverFit: String="fit",val screensaverInterval: Int=10,val screensaverClockPos: String="tr") {
+    val screensaverFit: String="fit",val screensaverInterval: Int=10,val screensaverClockPos: String="mid",
+    val softQuality: Int=360,
+    // 播放器键位/快进偏好与收藏排序（2026-11-21 查缺补漏）：这些值存在 playback-extras-v1 / native-library-v1 的独立键里，
+    // 不在 disk decode 的通用管道里，由 app 侧 provider 在 snapshot 时注入、restore 时回填
+    val autoSkip: Boolean=true,val seekStep: Int=10,val fastSpeed: Float=3f,
+    val menuKeyAction: String="panel",val dpadUpDownAction: String="panel",val mouseRightAction: String="exit",
+    val favoriteSort: String="update") {
     fun json()=JSONObject().put("quality",quality).put("speed",speed.toDouble()).put("autoNext",autoNext).put("type",type.storedValue).put("frame",frame.name).put("autoSeason",autoSeason).put("danmaku",danmaku)
         .put("danmakuOpacity",danmakuOpacity).put("danmakuFont",danmakuFont).put("danmakuSpeed",danmakuSpeed).put("danmakuRows",danmakuRows).put("showClock",showClock).put("sourceHidden",sourceHidden)
         .put("navHidden",JSONArray(navHidden.filter { it in LibraryBackup.NAV_KEYS }.sorted())).put("feedAutoSwipe",feedAutoSwipe)
         .put("screensaverMinutes",screensaverMinutes).put("screensaverStyle",screensaverStyle).put("screensaverMuted",screensaverMuted).put("screensaverMedia",screensaverMedia)
         .put("screensaverFit",screensaverFit).put("screensaverInterval",screensaverInterval).put("screensaverClockPos",screensaverClockPos)
+        .put("softQuality",softQuality)
+        .put("autoSkip",autoSkip).put("seekStep",seekStep).put("fastSpeed",fastSpeed.toDouble())
+        .put("menuKeyAction",menuKeyAction).put("dpadUpDownAction",dpadUpDownAction).put("mouseRightAction",mouseRightAction)
+        .put("favoriteSort",favoriteSort)
 }
 
 /** 待机屏保档位（用户 2026-11-19）：分钟数，0=关闭；非播放页空闲超过设定时长后盖全屏时钟。
- *  风格（用户 2026-11-19 加）：classic 经典墨夜 / neon 霓虹都市 / stars 星河流光 / breath 晨雾呼吸 / custom 自定义媒体（手机快传上传的图片、动图、视频）。 */
+ *  风格（用户 2026-11-19 加）：classic 经典墨夜 / neon 霓虹都市 / stars 星河流光 / breath 晨雾呼吸
+ *  / clockgold 仿真时钟·墨金 / clockdawn 仿真时钟·晨白（用户 2026-11-23 加，指针实时走动的自绘表盘）
+ *  / custom 自定义媒体（手机快传上传的图片、动图、视频）。 */
 object ScreenSaverPrefs {
     val LEVELS = listOf(5, 10, 15)
     /** key to 名称；顺序即跑马灯筛选顺序。 */
-    val STYLES = listOf("classic" to "经典墨夜","neon" to "霓虹都市","stars" to "星河流光","breath" to "晨雾呼吸","custom" to "我的素材")
+    val STYLES = listOf("classic" to "经典墨夜","neon" to "霓虹都市","stars" to "星河流光","breath" to "晨雾呼吸","clockgold" to "仿真时钟 · 墨金","clockdawn" to "仿真时钟 · 晨白","custom" to "我的素材")
     /** 自定义画面填充方式：fit 适应（整图可见、可能留黑边）/ fill 填充（铺满裁切）。 */
     val FITS = listOf("fit" to "适应","fill" to "填充")
     /** 轮播换图间隔（秒）。 */
     val INTERVALS = listOf(10, 30, 60)
-    /** 自定义屏保角标时钟位置：右上 / 左下 / 右下 / 不显示。 */
-    val CLOCK_POSITIONS = listOf("tr" to "右上","bl" to "左下","br" to "右下","off" to "不显示")
+    /** 屏保时钟位置：居中 / 右上 / 左下 / 右下 / 不显示。
+     *  2026-11-23 加「居中」并让内置风格真正跟随该设置（此前内置风格固定居中、设置不生效）。 */
+    val CLOCK_POSITIONS = listOf("mid" to "居中","tr" to "右上","bl" to "左下","br" to "右下","off" to "不显示")
     fun normalize(value: Int): Int = if (value in LEVELS) value else 0
     fun label(minutes: Int): String = if (minutes == 0) "关闭" else "$minutes 分钟"
     fun styleName(key: String): String = STYLES.firstOrNull { it.first == key }?.second ?: STYLES[0].second
@@ -211,7 +224,17 @@ object LibraryBackup {
         // 画面填充 / 轮播间隔 / 角标位置：旧备份缺字段时给默认值（2026-11-19）
         val screensaverFit=ScreenSaverPrefs.normalizeFit(settings.optString("screensaverFit","fit"))
         val screensaverInterval=ScreenSaverPrefs.normalizeInterval(settings.optInt("screensaverInterval",10))
-        val screensaverClockPos=ScreenSaverPrefs.normalizeClockPos(settings.optString("screensaverClockPos","tr"))
+        val screensaverClockPos=ScreenSaverPrefs.normalizeClockPos(settings.optString("screensaverClockPos","mid"))
+        // bvc2 软解清晰度上限：旧备份没有该字段时默认 360P（2026-11-21）
+        val softQuality=PlaybackQuality.normalizeSoft(settings.optInt("softQuality",360))
+        // 播放器键位/快进偏好与收藏排序：旧备份缺字段回落默认；非法值一律回落默认（与 app 侧常量保持一致）
+        val autoSkip=settings.optBoolean("autoSkip",true)
+        val seekStep=settings.optInt("seekStep",10).takeIf { it in listOf(10,15,30,60) } ?: 10
+        val fastSpeed=settings.optDouble("fastSpeed",3.0).toFloat().takeIf { it in listOf(2f,3f,4f) } ?: 3f
+        val menuKeyAction=settings.optString("menuKeyAction","panel").takeIf { it in listOf("panel","episodes","danmaku") } ?: "panel"
+        val dpadUpDownAction=settings.optString("dpadUpDownAction","panel").takeIf { it in listOf("panel","switch") } ?: "panel"
+        val mouseRightAction=settings.optString("mouseRightAction","exit").takeIf { it in listOf("exit","play","episodes","hud","panel") } ?: "exit"
+        val favoriteSort=settings.optString("favoriteSort","update").takeIf { it in listOf("update","watch","name") } ?: "update"
         // 三方源：旧备份没有该字段时静默为空；非法接口直接跳过，不影响整体恢复。
         // v2 字段（type/headers/元数据）缺失时回落 v1 默认值，新旧备份双向兼容
         val thirdSources=if(o.has("thirdSources")) o.rows("thirdSources",ThirdSourceConfig.MAX).mapNotNull { row ->
@@ -269,7 +292,7 @@ object LibraryBackup {
                 }.getOrNull()
             }
         }.getOrDefault(emptyList()) else emptyList()
-        return BackupData(favorites,history,watchedIds,searches,BackupSettings(quality,speed.toFloat(),autoNext,type,frame,autoSeason,danmaku,danmakuOpacity,danmakuFont,danmakuSpeed,danmakuRows,showClock,sourceHidden,navHidden,feedAutoSwipe,screensaverMinutes,screensaverStyle,screensaverMuted,screensaverMedia,screensaverFit,screensaverInterval,screensaverClockPos),later,hiddenIds,favoriteGroups,thirdSources,thirdHistory,thirdFavorites)
+        return BackupData(favorites,history,watchedIds,searches,BackupSettings(quality,speed.toFloat(),autoNext,type,frame,autoSeason,danmaku,danmakuOpacity,danmakuFont,danmakuSpeed,danmakuRows,showClock,sourceHidden,navHidden,feedAutoSwipe,screensaverMinutes,screensaverStyle,screensaverMuted,screensaverMedia,screensaverFit,screensaverInterval,screensaverClockPos,softQuality,autoSkip,seekStep,fastSpeed,menuKeyAction,dpadUpDownAction,mouseRightAction,favoriteSort),later,hiddenIds,favoriteGroups,thirdSources,thirdHistory,thirdFavorites)
     }
     /** Existing favorites stay first; only newer imported progress replaces a local record. */
     fun merge(local: BackupData,incoming: BackupData,restoreSettings: Boolean): BackupData {
